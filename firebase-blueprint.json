@@ -1,0 +1,121 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Indus Brain industrial worker or manager account profile",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique identifier for account login, same as employeeId" },
+        "name": { "type": "string", "description": "Full name of the user" },
+        "role": { "type": "string", "enum": ["owner", "manager", "worker"], "description": "Access privileges tier" },
+        "department": { "type": "string", "description": "Assigned industrial division" },
+        "email": { "type": "string", "description": "Work email address" },
+        "employeeId": { "type": "string", "description": "Standard company employee ID" },
+        "photoUrl": { "type": "string", "description": "Avatar image source" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp" }
+      },
+      "required": ["id", "name", "role", "department", "email", "employeeId", "createdAt"]
+    },
+    "Equipment": {
+      "title": "Equipment",
+      "description": "Industrial asset machinery record in plant inventory",
+      "type": "object",
+      "properties": {
+        "machineId": { "type": "string", "description": "Unique machine ID, e.g. CAR-ROBO-01" },
+        "machineName": { "type": "string", "description": "Human readable name of the asset" },
+        "location": { "type": "string", "description": "Exact plant floor physical location" },
+        "department": { "type": "string", "description": "Operating division" },
+        "status": { "type": "string", "enum": ["Operational", "Maintenance Required", "Shutdown"], "description": "Current status" },
+        "associatedSop": { "type": "string", "description": "Referenced safety operating procedure" },
+        "notes": { "type": "string", "description": "Maintenance alerts or operation comments" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["machineId", "machineName", "location", "department", "status", "createdAt", "updatedAt"]
+    },
+    "Document": {
+      "title": "Document",
+      "description": "Extracted safety SOP manual or technical PDF document",
+      "type": "object",
+      "properties": {
+        "documentId": { "type": "string", "description": "Unique ID of the document" },
+        "fileName": { "type": "string", "description": "Original file name of the document" },
+        "fileType": { "type": "string", "description": "Mime type or extension, e.g. application/pdf" },
+        "fileSize": { "type": "string", "description": "Size in human readable format" },
+        "status": { "type": "string", "enum": ["Pending", "Approved", "Rejected"], "description": "Review status" },
+        "uploadedBy": { "type": "string", "description": "Name or ID of the user uploading it" },
+        "extractedText": { "type": "string", "description": "Raw searchable text content of PDF" },
+        "uploadedAt": { "type": "string", "format": "date-time", "description": "Upload date-time" }
+      },
+      "required": ["documentId", "fileName", "fileSize", "status", "extractedText", "uploadedAt"]
+    },
+    "Report": {
+      "title": "Report",
+      "description": "Anomalies, hazards or missing document reports logged by floor staff",
+      "type": "object",
+      "properties": {
+        "reportId": { "type": "string", "description": "Unique report ID" },
+        "type": { "type": "string", "enum": ["Not working", "Missing file", "Other"], "description": "Problem category" },
+        "machineId": { "type": "string", "description": "Associated equipment ID if any" },
+        "description": { "type": "string", "description": "Detailed explanation of report" },
+        "photoUrl": { "type": "string", "description": "Base64 or URL screenshot of the fault" },
+        "priority": { "type": "string", "enum": ["Low", "Medium", "High", "Critical"], "description": "Inferred or manually set importance" },
+        "status": { "type": "string", "enum": ["Open", "Under Review", "Resolved"], "description": "Review state" },
+        "raisedBy": { "type": "string", "description": "Floor staff member who raised this report" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "reviewedBy": { "type": "string" },
+        "reviewedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["reportId", "type", "description", "status", "raisedBy", "createdAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Zero trust physical compliance operations audit track",
+      "type": "object",
+      "properties": {
+        "logId": { "type": "string", "description": "Unique log record ID" },
+        "userId": { "type": "string", "description": "Employee ID performing the action" },
+        "role": { "type": "string", "description": "Access role tier" },
+        "action": { "type": "string", "description": "Detailed action performed" },
+        "timestamp": { "type": "string", "format": "date-time", "description": "Operation time" }
+      },
+      "required": ["logId", "userId", "role", "action", "timestamp"]
+    },
+    "EmergencyContact": {
+      "title": "EmergencyContact",
+      "description": "Plant-wide safety wardens and emergency contacts",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "Name of contact person or station" },
+        "role": { "type": "string", "description": "Emergency responsibility role" },
+        "phone": { "type": "string", "description": "Emergency telephone number" },
+        "type": { "type": "string", "description": "Contact type descriptor" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "role", "phone", "updatedAt"]
+    },
+    "AIChat": {
+      "title": "AIChat",
+      "description": "Unified asset brain Gemini chat request audit trail",
+      "type": "object",
+      "properties": {
+        "chatId": { "type": "string", "description": "Unique chat transaction ID" },
+        "userId": { "type": "string", "description": "User requesting information" },
+        "question": { "type": "string", "description": "Industrial intelligence query" },
+        "answer": { "type": "string", "description": "Gemini generated intelligence response" },
+        "source": { "type": "string", "description": "SOP manual file or registry source" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["chatId", "userId", "question", "answer", "source", "createdAt"]
+    }
+  },
+  "firestore": {
+    "users": { "schema": "User", "description": "Employee profiles and account credentials" },
+    "equipment": { "schema": "Equipment", "description": "Industrial asset registry details" },
+    "documents": { "schema": "Document", "description": "Manuals, SOPs and extracted knowledge chunks" },
+    "reports": { "schema": "Report", "description": "Floor-staff raised reports and logs" },
+    "auditLogs": { "schema": "AuditLog", "description": "Immutable compliance activity records" },
+    "emergencyContacts": { "schema": "EmergencyContact", "description": "Plant safety contact registry" },
+    "aiChats": { "schema": "AIChat", "description": "AI assistance question answering audit trail" }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "INDUS BRAIN",
+  "description": "Unified Asset & Operations Brain - Premium minimalist industrial dashboard.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
