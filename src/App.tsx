@@ -95,7 +95,11 @@ export default function App() {
     try {
       const res = await fetch('/api/logs', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentSession?.id || 'anonymous',
+          'X-User-Role': currentSession?.role || 'anonymous'
+        },
         body: JSON.stringify({ user, role, action }),
       });
       if (res.ok) {
@@ -115,7 +119,11 @@ export default function App() {
     try {
       const res = await fetch('/api/accounts', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentSession?.id || '',
+          'X-User-Role': currentSession?.role || ''
+        },
         body: JSON.stringify({ action: 'add', account: newAcc, currentUserId: currentSession?.id }),
       });
       if (res.ok) {
@@ -137,7 +145,11 @@ export default function App() {
     try {
       const res = await fetch('/api/accounts', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentSession?.id || '',
+          'X-User-Role': currentSession?.role || ''
+        },
         body: JSON.stringify({ action: 'delete', targetId, currentUserId }),
       });
       if (res.ok) {
@@ -158,7 +170,11 @@ export default function App() {
     try {
       const res = await fetch('/api/employees/update', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentSession?.id || '',
+          'X-User-Role': currentSession?.role || ''
+        },
         body: JSON.stringify({ employee: updatedEmp, newPassword }),
       });
       if (res.ok) {
@@ -185,7 +201,11 @@ export default function App() {
     try {
       const res = await fetch('/api/documents/upload', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentSession?.id || '',
+          'X-User-Role': currentSession?.role || ''
+        },
         body: JSON.stringify({
           name: doc.name,
           text: doc.text || '',
@@ -209,7 +229,11 @@ export default function App() {
     try {
       const res = await fetch('/api/documents/action', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentSession?.id || '',
+          'X-User-Role': currentSession?.role || ''
+        },
         body: JSON.stringify({ action: 'delete', id }),
       });
       if (res.ok) {
@@ -227,7 +251,11 @@ export default function App() {
     try {
       const res = await fetch('/api/documents/action', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentSession?.id || '',
+          'X-User-Role': currentSession?.role || ''
+        },
         body: JSON.stringify({ action: 'rename', id, name: newName }),
       });
       if (res.ok) {
@@ -245,7 +273,11 @@ export default function App() {
     try {
       const res = await fetch('/api/documents/action', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentSession?.id || '',
+          'X-User-Role': currentSession?.role || ''
+        },
         body: JSON.stringify({ action: 'approve', id, status }),
       });
       if (res.ok) {
@@ -266,7 +298,11 @@ export default function App() {
     try {
       const res = await fetch('/api/documents/action', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentSession?.id || '',
+          'X-User-Role': currentSession?.role || ''
+        },
         body: JSON.stringify({ action: 'new_version', id, text, uploadedAt }),
       });
       if (res.ok) {
@@ -298,7 +334,11 @@ export default function App() {
     try {
       const res = await fetch('/api/reports', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentSession?.id || '',
+          'X-User-Role': currentSession?.role || ''
+        },
         body: JSON.stringify({ report: newReport }),
       });
       if (res.ok) {
@@ -316,7 +356,11 @@ export default function App() {
     try {
       const res = await fetch('/api/equipment', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentSession?.id || '',
+          'X-User-Role': currentSession?.role || ''
+        },
         body: JSON.stringify({ action: 'add', equipment: eq }),
       });
       if (res.ok) {
@@ -333,7 +377,11 @@ export default function App() {
     try {
       const res = await fetch('/api/equipment', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentSession?.id || '',
+          'X-User-Role': currentSession?.role || ''
+        },
         body: JSON.stringify({ action: 'edit', equipment: eq }),
       });
       if (res.ok) {
@@ -350,7 +398,11 @@ export default function App() {
     try {
       const res = await fetch('/api/equipment', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentSession?.id || '',
+          'X-User-Role': currentSession?.role || ''
+        },
         body: JSON.stringify({ action: 'delete', equipment: eq }),
       });
       if (res.ok) {
@@ -368,7 +420,11 @@ export default function App() {
     try {
       const res = await fetch('/api/emergency', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentSession?.id || '',
+          'X-User-Role': currentSession?.role || ''
+        },
         body: JSON.stringify({ emergency: newEmergency }),
       });
       if (res.ok) {
@@ -434,6 +490,7 @@ export default function App() {
             fireProcedures: '', chemicalSpillSops: '', emergencyContacts: [], firstAid: '', emergencyShutdown: '', evacuationProcedures: '', assemblyPoints: ''
           }}
           onAddReport={handleAddReport}
+          onUpdateEmployee={handleUpdateEmployee}
           onSignOut={handleSignOut}
         />
       )}

@@ -39,6 +39,35 @@ const getInitials = (name: string) => {
   return name.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase();
 };
 
+export function SafeAvatar({ name, photo, className = "w-10 h-10 text-xs" }: { name: string; photo?: string; className?: string }) {
+  const [hasError, setHasError] = useState(false);
+  
+  useEffect(() => {
+    // Reset error state if photo prop changes
+    setHasError(false);
+  }, [photo]);
+
+  const cleanPhoto = photo && photo.trim() !== '' && !photo.includes('images.unsplash.com') ? photo : null;
+  
+  if (!cleanPhoto || hasError) {
+    const initials = getInitials(name || 'User');
+    return (
+      <div className={`${className} rounded-full bg-neutral-900 text-white font-extrabold flex items-center justify-center uppercase border border-neutral-200 shrink-0 select-none shadow-sm font-sans`}>
+        {initials}
+      </div>
+    );
+  }
+  
+  return (
+    <img
+      src={cleanPhoto}
+      alt={name}
+      onError={() => setHasError(true)}
+      className={`${className} object-cover rounded-full border border-neutral-200 shrink-0 shadow-sm`}
+    />
+  );
+}
+
 export default function OwnerDashboard({
   currentUser,
   accounts,
@@ -66,7 +95,7 @@ export default function OwnerDashboard({
   const [isSidebarOpen, setSidebarOpen] = useState(false);
 
   const currentUserEmployee = employees.find(emp => emp.employeeId === currentUser.id);
-  const currentUserPhoto = currentUserEmployee?.photo || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&h=150&fit=crop';
+  const currentUserPhoto = currentUserEmployee?.photo || '';
 
   // Chat History & Session Management (ChatGPT-style!)
   const [sessions, setSessions] = useState<ChatSession[]>([]);
@@ -81,6 +110,8 @@ export default function OwnerDashboard({
   const [streamingText, setStreamingText] = useState('');
   const [isStreamWarning, setIsStreamWarning] = useState(false);
   const [chatImageBase64, setChatImageBase64] = useState<string | null>(null);
+  const [aiState, setAiState] = useState<'idle' | 'pending' | 'streaming' | 'error'>('idle');
+  const [aiError, setAiError] = useState<string | null>(null);
 
   // Voice States
   const [isListening, setIsListening] = useState(false);
@@ -340,7 +371,11 @@ export default function OwnerDashboard({
     try {
       const res = await fetch('/api/chat/sessions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentUser.id,
+          'X-User-Role': currentUser.role
+        },
         body: JSON.stringify({ action: 'list', userId: currentUser.id }),
       });
       if (res.ok) {
@@ -371,7 +406,11 @@ export default function OwnerDashboard({
     try {
       const res = await fetch('/api/chat/sessions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentUser.id,
+          'X-User-Role': currentUser.role
+        },
         body: JSON.stringify({ action: 'create', userId: currentUser.id, title: 'New Analysis' }),
       });
       if (res.ok) {
@@ -389,7 +428,11 @@ export default function OwnerDashboard({
     try {
       const res = await fetch('/api/chat/sessions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentUser.id,
+          'X-User-Role': currentUser.role
+        },
         body: JSON.stringify({ action: 'rename', userId: currentUser.id, sessionId: sid, title }),
       });
       if (res.ok) {
@@ -407,7 +450,11 @@ export default function OwnerDashboard({
     try {
       const res = await fetch('/api/chat/sessions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentUser.id,
+          'X-User-Role': currentUser.role
+        },
         body: JSON.stringify({ action: 'delete', userId: currentUser.id, sessionId: sid }),
       });
       if (res.ok) {
@@ -428,55 +475,97 @@ export default function OwnerDashboard({
     if (!chatInput.trim() && !chatImageBase64) return;
 
     let targetSid = activeSessionId;
-    if (!targetSid) {
-      // Auto-create session if none active
-      const res = await fetch('/api/chat/sessions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'create', userId: currentUser.id, title: chatInput.substring(0, 24) || 'Image Analysis' }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setSessions(data.sessions);
-        targetSid = data.activeId;
-        setActiveSessionId(data.activeId);
-      } else {
-        return;
-      }
-    }
-
-    const messageText = chatInput;
-    setChatInput('');
+    setAiState('pending');
+    setAiError(null);
     setIsStreaming(true);
     setStreamingText('');
     setIsStreamWarning(false);
 
     try {
+      if (!targetSid) {
+        // Auto-create session if none active
+        const res = await fetch('/api/chat/sessions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-User-Id': currentUser.id,
+            'X-User-Role': currentUser.role
+          },
+          body: JSON.stringify({ action: 'create', userId: currentUser.id, title: chatInput.substring(0, 24) || 'Image Analysis' }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setSessions(data.sessions);
+          targetSid = data.activeId;
+          setActiveSessionId(data.activeId);
+        } else {
+          throw new Error('Failed to create chat session');
+        }
+      }
+
+      const messageText = chatInput;
+      setChatInput('');
+
+      const controller = new AbortController();
+      let timer = setTimeout(() => {
+        controller.abort();
+      }, 15000);
+
+      const resetTimer = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          controller.abort();
+        }, 15000);
+      };
+
       const res = await fetch('/api/chat/stream', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentUser.id,
+          'X-User-Role': currentUser.role
+        },
         body: JSON.stringify({
           userId: currentUser.id,
           sessionId: targetSid,
           message: messageText,
           imageBase64: chatImageBase64
         }),
+        signal: controller.signal
       });
 
+      // Optimistically fetch sessions to display user message instantly
+      await fetchSessions();
+
       if (!res.ok) {
-        throw new Error('Streaming connection failed');
+        clearTimeout(timer);
+        if (res.status === 401) {
+          throw new Error('Unauthorized: The AI API key is invalid or unauthorized.');
+        } else if (res.status === 429) {
+          throw new Error('Rate Limit Exceeded: The AI service is currently busy or the request limit has been reached.');
+        } else {
+          throw new Error(`Operations Gateway returned status ${res.status}`);
+        }
       }
 
       setChatImageBase64(null); // Clear image preview
 
       const reader = res.body?.getReader();
       const decoder = new TextDecoder('utf-8');
-      if (!reader) return;
+      if (!reader) {
+        clearTimeout(timer);
+        throw new Error('Failed to load streaming reader');
+      }
 
       let buffer = '';
       while (true) {
         const { value, done } = await reader.read();
+        resetTimer(); // Reset watchdog timer on receiving data
+
         if (done) break;
+
+        // Transition from pending to streaming on first data chunk
+        setAiState('streaming');
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
@@ -491,7 +580,8 @@ export default function OwnerDashboard({
           try {
             const parsed = JSON.parse(cleanLine.substring(6));
             if (parsed.error) {
-              setStreamingText((p) => p + `\n[Stream Error: ${parsed.error}]`);
+              setAiError(parsed.error);
+              setAiState('error');
             } else if (parsed.text !== undefined) {
               setStreamingText(parsed.text);
               if (parsed.isWarning) {
@@ -499,20 +589,30 @@ export default function OwnerDashboard({
               }
             }
             if (parsed.done) {
+              clearTimeout(timer);
               // Final payload received, refresh sessions from DB
               await fetchSessions();
               setIsStreaming(false);
               setStreamingText('');
+              setAiState('idle');
             }
           } catch (e) {
             // ignore JSON parse errors of incomplete chunk boundaries
           }
         }
       }
+      clearTimeout(timer);
     } catch (err: any) {
       console.error('Streaming error:', err);
-      setStreamingText(`Failed to connect to the intelligence gateway: ${err.message}`);
       setIsStreaming(false);
+      setStreamingText('');
+      
+      let finalErrMsg = err.message;
+      if (err.name === 'AbortError') {
+        finalErrMsg = 'Request timed out: Operations Gateway did not respond within 15 seconds. Please check the network connectivity or try again.';
+      }
+      setAiError(finalErrMsg);
+      setAiState('error');
     }
   };
 
@@ -1007,17 +1107,11 @@ export default function OwnerDashboard({
               className="group relative cursor-pointer shrink-0"
               title="Click to edit profile"
             >
-              {currentUserEmployee?.photo ? (
-                <img
-                  src={currentUserEmployee.photo}
-                  alt={currentUser.name}
-                  className="w-10 h-10 object-cover rounded-full border border-white/10 shadow-lg group-hover:opacity-75 transition-all"
-                />
-              ) : (
-                <div className="w-10 h-10 rounded-full bg-neutral-100 text-neutral-900 font-extrabold text-xs flex items-center justify-center uppercase border border-white/10 shadow-lg group-hover:bg-neutral-200 transition-all">
-                  {getInitials(currentUser.name)}
-                </div>
-              )}
+              <SafeAvatar
+                name={currentUser.name}
+                photo={currentUserEmployee?.photo}
+                className="w-10 h-10 border border-white/10 shadow-lg group-hover:opacity-75 transition-all"
+              />
               {/* Overlay edit icon */}
               <div className="absolute inset-0 bg-black/40 rounded-full opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity duration-200">
                 <Camera size={12} className="text-white" />
@@ -1333,16 +1427,31 @@ export default function OwnerDashboard({
                             </div>
 
                             {msg.sender === 'me' && (
-                              <img
-                                src={currentUserPhoto}
-                                alt="Me"
-                                className="w-6 h-6 object-cover rounded-full border border-neutral-200 shrink-0 mt-1.5 shadow-sm"
+                              <SafeAvatar
+                                name={currentUser.name}
+                                photo={currentUserPhoto}
+                                className="w-6 h-6 border border-neutral-200 shrink-0 mt-1.5 shadow-sm"
                               />
                             )}
                           </div>
                         ))}
 
-                        {/* Streaming response */}
+                        {aiState === 'pending' && !streamingText && (
+                          <div className="flex gap-3.5 max-w-3xl mr-auto justify-start animate-pulse">
+                            <div className="w-6 h-6 shrink-0 mt-1.5 bg-neutral-900 rounded-lg flex items-center justify-center text-white text-[8px] font-bold">IB</div>
+                            <div className="space-y-1">
+                              <div className="p-4 rounded-2xl rounded-tl-sm text-xs leading-relaxed max-w-xl shadow-[0_2px_12px_rgba(0,0,0,0.03)] border border-neutral-200/40 bg-white/80 text-neutral-500 backdrop-blur-md flex items-center gap-2">
+                                <span className="flex space-x-1 shrink-0">
+                                  <span className="w-1.5 h-1.5 bg-neutral-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
+                                  <span className="w-1.5 h-1.5 bg-neutral-500 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
+                                  <span className="w-1.5 h-1.5 bg-neutral-500 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
+                                </span>
+                                <span>Operations Brain is analyzing your request...</span>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+
                         {isStreaming && streamingText && (
                           <div className="flex gap-3.5 max-w-3xl mr-auto justify-start">
                             <div className="w-6 h-6 shrink-0 mt-1.5 bg-neutral-900 rounded-lg flex items-center justify-center text-white text-[8px] font-bold animate-pulse">IB</div>
@@ -1353,6 +1462,28 @@ export default function OwnerDashboard({
                               >
                                 {streamingText}
                                 <span className="inline-block w-1.5 h-3.5 bg-neutral-900 animate-pulse ml-1 align-middle"></span>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+
+                        {aiError && (
+                          <div className="flex gap-3.5 max-w-3xl mr-auto justify-start animate-fadeIn">
+                            <div className="w-6 h-6 shrink-0 mt-1.5 bg-red-600 rounded-lg flex items-center justify-center text-white text-[10px] font-bold shadow-md">⚠️</div>
+                            <div className="space-y-1">
+                              <div className="p-4 rounded-2xl rounded-tl-sm text-xs leading-relaxed max-w-xl shadow-[0_2px_12px_rgba(239,68,68,0.05)] border bg-red-50/90 border-red-200 text-red-900 backdrop-blur-md">
+                                <p className="font-semibold mb-1">Operations Interruption</p>
+                                <p className="text-red-700/90 mb-3 leading-relaxed">{aiError}</p>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setAiError(null);
+                                    setAiState('idle');
+                                  }}
+                                  className="px-3 py-1 bg-white hover:bg-neutral-50 text-neutral-800 border border-neutral-200 rounded-lg font-medium transition-all text-[11px] shadow-sm cursor-pointer"
+                                >
+                                  Dismiss
+                                </button>
                               </div>
                             </div>
                           </div>
@@ -1387,16 +1518,29 @@ export default function OwnerDashboard({
                       <input
                         type="text"
                         className="flex-1 text-xs outline-none bg-transparent py-2 px-1 text-neutral-800 placeholder-neutral-400"
-                        placeholder={isStreaming ? 'Thinking...' : 'Query manuals, procedures, panels or ask anything...'}
+                        placeholder={
+                          aiState === 'pending'
+                            ? "Connecting to Operations Gateway..."
+                            : aiState === 'streaming'
+                              ? "Receiving operations data..."
+                              : "Query manuals, procedures, panels or ask anything..."
+                        }
                         value={chatInput}
                         onChange={(e) => setChatInput(e.target.value)}
-                        disabled={isStreaming}
+                        disabled={aiState === 'pending' || aiState === 'streaming'}
                       />
 
                       <button
                         type="button"
                         onClick={toggleSpeechRecognition}
-                        className={`p-2 rounded-xl transition-all ${isListening ? 'bg-red-50 text-red-500 animate-pulse' : 'text-neutral-400 hover:text-black hover:bg-neutral-100'}`}
+                        disabled={aiState === 'pending' || aiState === 'streaming'}
+                        className={`p-2 rounded-xl transition-all ${
+                          isListening
+                            ? 'bg-red-50 text-red-500 animate-pulse'
+                            : (aiState === 'pending' || aiState === 'streaming')
+                              ? 'text-neutral-200 cursor-not-allowed'
+                              : 'text-neutral-400 hover:text-black hover:bg-neutral-100'
+                        }`}
                         title="Talk to assistant"
                       >
                         <Mic size={14} />
@@ -1405,9 +1549,21 @@ export default function OwnerDashboard({
                       <button
                         type="submit"
                         className="btn-glass-primary p-2.5 w-9 h-9 rounded-xl text-white shrink-0 flex items-center justify-center hover-lift"
-                        disabled={isStreaming || (!chatInput.trim() && !chatImageBase64)}
+                        disabled={
+                          aiState === 'pending' ||
+                          aiState === 'streaming' ||
+                          (!chatInput.trim() && !chatImageBase64)
+                        }
                       >
-                        {isStreaming ? '...' : <ArrowRight size={13} />}
+                        {aiState === 'pending' || aiState === 'streaming' ? (
+                          <span className="flex space-x-0.5">
+                            <span className="w-1.5 h-1.5 bg-white rounded-full animate-pulse" style={{ animationDelay: '0ms' }}></span>
+                            <span className="w-1.5 h-1.5 bg-white rounded-full animate-pulse" style={{ animationDelay: '200ms' }}></span>
+                            <span className="w-1.5 h-1.5 bg-white rounded-full animate-pulse" style={{ animationDelay: '400ms' }}></span>
+                          </span>
+                        ) : (
+                          <ArrowRight size={13} />
+                        )}
                       </button>
                     </form>
                   </div>
@@ -1932,17 +2088,11 @@ export default function OwnerDashboard({
                     {employees.map((emp) => (
                       <div key={emp.employeeId} className="py-3 flex items-center justify-between">
                         <div className="flex items-center gap-3">
-                          {emp.photo ? (
-                            <img
-                              src={emp.photo}
-                              alt={emp.name}
-                              className="w-9 h-9 object-cover rounded-full border border-neutral-200 shrink-0 shadow-sm"
-                            />
-                          ) : (
-                            <div className="w-9 h-9 rounded-full bg-neutral-900 text-white font-extrabold text-xs flex items-center justify-center uppercase shrink-0 border border-neutral-200 shadow-sm">
-                              {getInitials(emp.name)}
-                            </div>
-                          )}
+                          <SafeAvatar
+                            name={emp.name}
+                            photo={emp.photo}
+                            className="w-9 h-9 border border-neutral-200 shrink-0 shadow-sm"
+                          />
                           <div>
                             <div className="flex items-center gap-1.5">
                               <span className="text-xs font-semibold text-neutral-900">{emp.name}</span>
@@ -2010,17 +2160,11 @@ export default function OwnerDashboard({
                         return (
                           <tr key={l.id} className="hover:bg-neutral-50/20">
                             <td className="p-3 font-semibold text-neutral-900 flex items-center gap-2">
-                              {hasPhoto ? (
-                                <img
-                                  src={matchedEmp.photo}
-                                  alt={l.user}
-                                  className="w-5 h-5 object-cover rounded-full border border-neutral-200/50 shrink-0 shadow-xs"
-                                />
-                              ) : (
-                                <div className="w-5 h-5 rounded-full bg-neutral-900 text-white font-extrabold text-[8px] flex items-center justify-center uppercase shrink-0 border border-neutral-200 shadow-xs">
-                                  {getInitials(l.user)}
-                                </div>
-                              )}
+                              <SafeAvatar
+                                name={l.user}
+                                photo={matchedEmp?.photo}
+                                className="w-5 h-5 border border-neutral-200/50 shrink-0 shadow-xs"
+                              />
                               <span>{l.user}</span>
                             </td>
                             <td className="p-3 uppercase text-[10px] text-neutral-400">{l.role}</td>
@@ -2882,10 +3026,10 @@ export default function OwnerDashboard({
                   onClick={() => profilePhotoInputRef.current?.click()}
                   className="w-[130px] h-[130px] rounded-full relative overflow-visible mx-auto border border-neutral-200/80 shadow-lg bg-neutral-50/50 backdrop-blur-md group cursor-pointer hover:scale-[1.03] active:scale-[0.99] transition-all duration-300"
                 >
-                  <img
-                    src={editingEmployee.photo || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&h=150&fit=crop'}
-                    alt="Employee profile"
-                    className="w-full h-full object-cover rounded-full border border-neutral-200/60 shadow-inner"
+                  <SafeAvatar
+                    name={editingEmployee.name}
+                    photo={editingEmployee.photo}
+                    className="w-full h-full"
                   />
                   <div className="absolute bottom-1 right-1 bg-neutral-900 text-white hover:bg-black p-2.5 rounded-full border border-white shadow-md cursor-pointer hover:scale-110 active:scale-95 transition-all duration-200 shadow-black/15 flex items-center justify-center">
                     <Camera size={14} />
@@ -3020,17 +3164,11 @@ export default function OwnerDashboard({
                   onClick={() => editProfilePhotoInputRef.current?.click()}
                   className="w-[130px] h-[130px] rounded-full relative overflow-visible mx-auto border border-neutral-200/80 shadow-lg bg-neutral-50/50 backdrop-blur-md group cursor-pointer hover:scale-[1.03] active:scale-[0.99] transition-all duration-300 flex items-center justify-center"
                 >
-                  {editProfilePhoto ? (
-                    <img
-                      src={editProfilePhoto}
-                      alt={editProfileName}
-                      className="w-full h-full object-cover rounded-full border border-neutral-200/60 shadow-inner"
-                    />
-                  ) : (
-                    <div className="w-full h-full rounded-full bg-neutral-900 text-white font-extrabold text-2xl flex items-center justify-center uppercase shadow-inner">
-                      {getInitials(editProfileName)}
-                    </div>
-                  )}
+                  <SafeAvatar
+                    name={editProfileName}
+                    photo={editProfilePhoto}
+                    className="w-full h-full"
+                  />
                   <div className="absolute bottom-1 right-1 bg-neutral-900 text-white hover:bg-black p-2.5 rounded-full border border-white shadow-md cursor-pointer hover:scale-110 active:scale-95 transition-all duration-200 shadow-black/15 flex items-center justify-center">
                     <Camera size={14} />
                   </div>

@@ -11,7 +11,7 @@ export default function LoginScreen({ accounts, onLoginSuccess }: LoginScreenPro
   const [password, setPassword] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
 
-  const handleLogin = (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     const cleanId = userId.trim();
     const cleanPw = password;
@@ -21,20 +21,28 @@ export default function LoginScreen({ accounts, onLoginSuccess }: LoginScreenPro
       return;
     }
 
-    const matchedAccount = accounts.find((a) => a.id === cleanId);
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: cleanId, password: cleanPw })
+      });
 
-    if (!matchedAccount) {
-      setErrorMsg('Account not found.');
-      return;
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.user) {
+          setErrorMsg('');
+          onLoginSuccess(data.user);
+        } else {
+          setErrorMsg('Authentication failed.');
+        }
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setErrorMsg(data.error || 'Incorrect credentials. Please try again.');
+      }
+    } catch (err) {
+      setErrorMsg('Network error. Failed to connect to server.');
     }
-
-    if (matchedAccount.password !== cleanPw) {
-      setErrorMsg('Incorrect password. Please check your credentials and try again.');
-      return;
-    }
-
-    setErrorMsg('');
-    onLoginSuccess(matchedAccount);
   };
 
   return (

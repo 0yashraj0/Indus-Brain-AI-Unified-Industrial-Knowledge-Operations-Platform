@@ -5,6 +5,39 @@ import {
 } from 'lucide-react';
 import { Account, WorkerReport, ChatMessage, Document, Equipment, EmergencyData, ChatSession, Employee } from '../types';
 
+const getInitials = (name: string) => {
+  if (!name) return '?';
+  return name.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase();
+};
+
+export function SafeAvatar({ name, photo, className = "w-10 h-10 text-xs" }: { name: string; photo?: string; className?: string }) {
+  const [hasError, setHasError] = useState(false);
+  
+  useEffect(() => {
+    setHasError(false);
+  }, [photo]);
+
+  const cleanPhoto = photo && photo.trim() !== '' && !photo.includes('images.unsplash.com') ? photo : null;
+  
+  if (!cleanPhoto || hasError) {
+    const initials = getInitials(name || 'User');
+    return (
+      <div className={`${className} rounded-full bg-neutral-900 text-white font-extrabold flex items-center justify-center uppercase border border-neutral-200 shrink-0 select-none shadow-sm font-sans`}>
+        {initials}
+      </div>
+    );
+  }
+  
+  return (
+    <img
+      src={cleanPhoto}
+      alt={name}
+      onError={() => setHasError(true)}
+      className={`${className} object-cover rounded-full border border-neutral-200 shrink-0 shadow-sm`}
+    />
+  );
+}
+
 interface WorkerDashboardProps {
   currentUser: Account;
   employees: Employee[];
@@ -12,6 +45,7 @@ interface WorkerDashboardProps {
   equipment: Equipment[];
   emergency: EmergencyData;
   onAddReport: (report: Omit<WorkerReport, 'id' | 'timestamp' | 'workerName'>) => void;
+  onUpdateEmployee: (emp: Employee, newPassword?: string) => Promise<void>;
   onSignOut: () => void;
 }
 
@@ -24,13 +58,53 @@ export default function WorkerDashboard({
   equipment,
   emergency,
   onAddReport,
+  onUpdateEmployee,
   onSignOut,
 }: WorkerDashboardProps) {
   const [activeTab, setActiveTab] = useState<WorkerTab>('ask');
   const [isSidebarOpen, setSidebarOpen] = useState(false);
 
   const currentUserEmployee = employees.find(emp => emp.employeeId === currentUser.id);
-  const currentUserPhoto = currentUserEmployee?.photo || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&h=150&fit=crop';
+  const currentUserPhoto = currentUserEmployee?.photo || '';
+
+  const [isEditProfileModalOpen, setIsEditProfileModalOpen] = useState(false);
+  const [editProfileName, setEditProfileName] = useState(currentUser.name);
+  const [editProfilePhoto, setEditProfilePhoto] = useState(currentUserPhoto);
+  const [editProfilePassword, setEditProfilePassword] = useState('');
+  const [editProfileError, setEditProfileError] = useState('');
+  const [editProfileSuccess, setEditProfileSuccess] = useState('');
+  const editProfilePhotoInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setEditProfileName(currentUser.name);
+    setEditProfilePhoto(currentUserPhoto);
+  }, [currentUser.name, currentUserPhoto]);
+
+  const handleSaveProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setEditProfileError('');
+    setEditProfileSuccess('');
+
+    if (!currentUserEmployee) return;
+
+    try {
+      const updatedEmp: Employee = {
+        ...currentUserEmployee,
+        name: editProfileName,
+        photo: editProfilePhoto
+      };
+
+      await onUpdateEmployee(updatedEmp, editProfilePassword || undefined);
+      setEditProfileSuccess('Profile updated successfully!');
+      setTimeout(() => {
+        setIsEditProfileModalOpen(false);
+        setEditProfileSuccess('');
+        setEditProfilePassword('');
+      }, 1500);
+    } catch (error) {
+      setEditProfileError('Failed to update profile. Please try again.');
+    }
+  };
 
   const getEmergencyContacts = () => {
     const ownerEmp = employees.find(e => e.role === 'owner');
@@ -106,6 +180,8 @@ export default function WorkerDashboard({
   const [streamingText, setStreamingText] = useState('');
   const [isStreamWarning, setIsStreamWarning] = useState(false);
   const [chatImageBase64, setChatImageBase64] = useState<string | null>(null);
+  const [aiState, setAiState] = useState<'idle' | 'pending' | 'streaming' | 'error'>('idle');
+  const [aiError, setAiError] = useState<string | null>(null);
 
   // Voice States
   const [isListening, setIsListening] = useState(false);
@@ -134,7 +210,11 @@ export default function WorkerDashboard({
     try {
       const res = await fetch('/api/chat/sessions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentUser.id,
+          'X-User-Role': currentUser.role
+        },
         body: JSON.stringify({ action: 'list', userId: currentUser.id }),
       });
       if (res.ok) {
@@ -165,7 +245,11 @@ export default function WorkerDashboard({
     try {
       const res = await fetch('/api/chat/sessions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentUser.id,
+          'X-User-Role': currentUser.role
+        },
         body: JSON.stringify({ action: 'create', userId: currentUser.id, title: 'New Worker Inquiry' }),
       });
       if (res.ok) {
@@ -184,7 +268,11 @@ export default function WorkerDashboard({
     try {
       const res = await fetch('/api/chat/sessions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentUser.id,
+          'X-User-Role': currentUser.role
+        },
         body: JSON.stringify({ action: 'delete', userId: currentUser.id, sessionId: sid }),
       });
       if (res.ok) {
@@ -205,54 +293,96 @@ export default function WorkerDashboard({
     if (!chatInput.trim() && !chatImageBase64) return;
 
     let targetSid = activeSessionId;
-    if (!targetSid) {
-      const res = await fetch('/api/chat/sessions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'create', userId: currentUser.id, title: chatInput.substring(0, 24) || 'Worker Panel' }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setSessions(data.sessions);
-        targetSid = data.activeId;
-        setActiveSessionId(data.activeId);
-      } else {
-        return;
-      }
-    }
-
-    const messageText = chatInput;
-    setChatInput('');
+    setAiState('pending');
+    setAiError(null);
     setIsStreaming(true);
     setStreamingText('');
     setIsStreamWarning(false);
 
     try {
+      if (!targetSid) {
+        const res = await fetch('/api/chat/sessions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-User-Id': currentUser.id,
+            'X-User-Role': currentUser.role
+          },
+          body: JSON.stringify({ action: 'create', userId: currentUser.id, title: chatInput.substring(0, 24) || 'Worker Panel' }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setSessions(data.sessions);
+          targetSid = data.activeId;
+          setActiveSessionId(data.activeId);
+        } else {
+          throw new Error('Failed to create chat session');
+        }
+      }
+
+      const messageText = chatInput;
+      setChatInput('');
+
+      const controller = new AbortController();
+      let timer = setTimeout(() => {
+        controller.abort();
+      }, 15000);
+
+      const resetTimer = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          controller.abort();
+        }, 15000);
+      };
+
       const res = await fetch('/api/chat/stream', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Id': currentUser.id,
+          'X-User-Role': currentUser.role
+        },
         body: JSON.stringify({
           userId: currentUser.id,
           sessionId: targetSid,
           message: messageText,
           imageBase64: chatImageBase64
         }),
+        signal: controller.signal
       });
 
+      // Optimistically fetch sessions to display the user's new message instantly
+      await fetchSessions();
+
       if (!res.ok) {
-        throw new Error('Streaming failed');
+        clearTimeout(timer);
+        if (res.status === 401) {
+          throw new Error('Unauthorized: The AI API key is invalid or unauthorized.');
+        } else if (res.status === 429) {
+          throw new Error('Rate Limit Exceeded: The AI service is currently busy or the request limit has been reached.');
+        } else {
+          throw new Error(`Operations Gateway returned status ${res.status}`);
+        }
       }
 
       setChatImageBase64(null);
 
       const reader = res.body?.getReader();
       const decoder = new TextDecoder('utf-8');
-      if (!reader) return;
+      if (!reader) {
+        clearTimeout(timer);
+        throw new Error('Failed to load streaming reader');
+      }
 
       let buffer = '';
       while (true) {
         const { value, done } = await reader.read();
+        resetTimer(); // Reset the 15s timer on receiving data
+
         if (done) break;
+
+        // Transition from pending to streaming once we receive actual data chunks
+        setAiState('streaming');
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
@@ -265,7 +395,8 @@ export default function WorkerDashboard({
           try {
             const parsed = JSON.parse(cleanLine.substring(6));
             if (parsed.error) {
-              setStreamingText((p) => p + `\n[Stream Error: ${parsed.error}]`);
+              setAiError(parsed.error);
+              setAiState('error');
             } else if (parsed.text !== undefined) {
               setStreamingText(parsed.text);
               if (parsed.isWarning) {
@@ -273,19 +404,29 @@ export default function WorkerDashboard({
               }
             }
             if (parsed.done) {
+              clearTimeout(timer);
               await fetchSessions();
               setIsStreaming(false);
               setStreamingText('');
+              setAiState('idle');
             }
           } catch (e) {
             // ignore partial JSON bounds
           }
         }
       }
+      clearTimeout(timer);
     } catch (err: any) {
       console.error('Streaming error:', err);
-      setStreamingText(`Failed to connect to Operations Brain: ${err.message}`);
       setIsStreaming(false);
+      setStreamingText('');
+      
+      let finalErrMsg = err.message;
+      if (err.name === 'AbortError') {
+        finalErrMsg = 'Request timed out: Operations Gateway did not respond within 15 seconds. Please check the network connectivity or try again.';
+      }
+      setAiError(finalErrMsg);
+      setAiState('error');
     }
   };
 
@@ -429,11 +570,21 @@ export default function WorkerDashboard({
           </div>
 
           <div className="idBlock mb-8 pb-6 border-b border-white/5 flex items-center gap-3">
-            <img
-              src={currentUserPhoto}
-              alt={currentUser.name}
-              className="w-10 h-10 object-cover rounded-full border border-white/10 shadow-lg shrink-0"
-            />
+            <div 
+              onClick={() => setIsEditProfileModalOpen(true)}
+              className="group relative cursor-pointer shrink-0 animate-fade-in"
+              title="Click to edit profile"
+            >
+              <SafeAvatar
+                name={currentUser.name}
+                photo={currentUserPhoto}
+                className="w-10 h-10 border border-white/10 shadow-lg group-hover:opacity-75 transition-all"
+              />
+              {/* Overlay edit icon */}
+              <div className="absolute inset-0 bg-black/40 rounded-full opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity duration-200">
+                <Camera size={12} className="text-white" />
+              </div>
+            </div>
             <div>
               <div className="who text-[9px] uppercase tracking-widest text-neutral-500 font-bold mb-0.5">Signed in as</div>
               <div className="nm text-sm font-extrabold text-white tracking-tight leading-tight" id="workerNameDisplay">
@@ -677,14 +828,30 @@ export default function WorkerDashboard({
                             </div>
 
                             {msg.sender === 'me' && (
-                              <img
-                                src={currentUserPhoto}
-                                alt="Me"
-                                className="w-6 h-6 object-cover rounded-full border border-neutral-200 shrink-0 mt-1.5 shadow-sm"
+                              <SafeAvatar
+                                name={currentUser.name}
+                                photo={currentUserPhoto}
+                                className="w-6 h-6 border border-neutral-200 shrink-0 mt-1.5 shadow-sm"
                               />
                             )}
                           </div>
                         ))}
+
+                        {aiState === 'pending' && !streamingText && (
+                          <div className="flex gap-3.5 max-w-3xl mr-auto justify-start animate-pulse">
+                            <div className="w-6 h-6 shrink-0 mt-1.5 bg-neutral-900 rounded-lg flex items-center justify-center text-white text-[8px] font-bold">IB</div>
+                            <div className="space-y-1">
+                              <div className="p-4 rounded-2xl rounded-tl-sm text-xs leading-relaxed max-w-xl shadow-[0_2px_12px_rgba(0,0,0,0.03)] border border-neutral-200/40 bg-white/80 text-neutral-500 backdrop-blur-md flex items-center gap-2">
+                                <span className="flex space-x-1 shrink-0">
+                                  <span className="w-1.5 h-1.5 bg-neutral-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
+                                  <span className="w-1.5 h-1.5 bg-neutral-500 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
+                                  <span className="w-1.5 h-1.5 bg-neutral-500 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
+                                </span>
+                                <span>Operations Brain is analyzing your request...</span>
+                              </div>
+                            </div>
+                          </div>
+                        )}
 
                         {isStreaming && streamingText && (
                           <div className="flex gap-3.5 max-w-3xl mr-auto justify-start">
@@ -696,6 +863,28 @@ export default function WorkerDashboard({
                               >
                                 {streamingText}
                                 <span className="inline-block w-1.5 h-3.5 bg-neutral-900 animate-pulse ml-1 align-middle"></span>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+
+                        {aiError && (
+                          <div className="flex gap-3.5 max-w-3xl mr-auto justify-start animate-fadeIn">
+                            <div className="w-6 h-6 shrink-0 mt-1.5 bg-red-600 rounded-lg flex items-center justify-center text-white text-[10px] font-bold shadow-md">⚠️</div>
+                            <div className="space-y-1">
+                              <div className="p-4 rounded-2xl rounded-tl-sm text-xs leading-relaxed max-w-xl shadow-[0_2px_12px_rgba(239,68,68,0.05)] border bg-red-50/90 border-red-200 text-red-900 backdrop-blur-md">
+                                <p className="font-semibold mb-1">Operations Interruption</p>
+                                <p className="text-red-700/90 mb-3 leading-relaxed">{aiError}</p>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setAiError(null);
+                                    setAiState('idle');
+                                  }}
+                                  className="px-3 py-1 bg-white hover:bg-neutral-50 text-neutral-800 border border-neutral-200 rounded-lg font-medium transition-all text-[11px] shadow-sm cursor-pointer"
+                                >
+                                  Dismiss
+                                </button>
                               </div>
                             </div>
                           </div>
@@ -730,16 +919,29 @@ export default function WorkerDashboard({
                       <input
                         type="text"
                         className="flex-1 text-xs outline-none bg-transparent py-2 px-1 text-neutral-800"
-                        placeholder="Type or speak a question..."
+                        placeholder={
+                          aiState === 'pending'
+                            ? "Connecting to Operations Gateway..."
+                            : aiState === 'streaming'
+                              ? "Receiving operations data..."
+                              : "Type or speak a question..."
+                        }
                         value={chatInput}
                         onChange={(e) => setChatInput(e.target.value)}
-                        disabled={isStreaming}
+                        disabled={aiState === 'pending' || aiState === 'streaming'}
                       />
 
                       <button
                         type="button"
                         onClick={toggleSpeechRecognition}
-                        className={`p-2 rounded-xl transition-all ${isListening ? 'bg-red-50 text-red-500 animate-pulse' : 'text-neutral-400 hover:text-black hover:bg-neutral-100'}`}
+                        disabled={aiState === 'pending' || aiState === 'streaming'}
+                        className={`p-2 rounded-xl transition-all ${
+                          isListening
+                            ? 'bg-red-50 text-red-500 animate-pulse'
+                            : (aiState === 'pending' || aiState === 'streaming')
+                              ? 'text-neutral-200 cursor-not-allowed'
+                              : 'text-neutral-400 hover:text-black hover:bg-neutral-100'
+                        }`}
                       >
                         <Mic size={14} />
                       </button>
@@ -747,9 +949,21 @@ export default function WorkerDashboard({
                       <button
                         type="submit"
                         className="btn-glass-primary p-2.5 w-9 h-9 rounded-xl text-white shrink-0 flex items-center justify-center hover-lift"
-                        disabled={isStreaming || (!chatInput.trim() && !chatImageBase64)}
+                        disabled={
+                          aiState === 'pending' ||
+                          aiState === 'streaming' ||
+                          (!chatInput.trim() && !chatImageBase64)
+                        }
                       >
-                        <ArrowRight size={13} />
+                        {aiState === 'pending' || aiState === 'streaming' ? (
+                          <span className="flex space-x-0.5">
+                            <span className="w-1.5 h-1.5 bg-white rounded-full animate-pulse" style={{ animationDelay: '0ms' }}></span>
+                            <span className="w-1.5 h-1.5 bg-white rounded-full animate-pulse" style={{ animationDelay: '200ms' }}></span>
+                            <span className="w-1.5 h-1.5 bg-white rounded-full animate-pulse" style={{ animationDelay: '400ms' }}></span>
+                          </span>
+                        ) : (
+                          <ArrowRight size={13} />
+                        )}
                       </button>
                     </form>
                   </div>
@@ -1178,6 +1392,146 @@ export default function WorkerDashboard({
                 Close Preview
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* WORKER EDIT PROFILE MODAL */}
+      {isEditProfileModalOpen && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center z-50 p-4 text-neutral-800">
+          <div className="bg-white/95 backdrop-blur-lg border border-neutral-200/80 max-w-sm w-full p-6 shadow-2xl rounded-[28px] relative">
+            <h3 className="text-sm font-bold uppercase tracking-wider text-gray-900 mb-5 text-center">
+              Edit My Profile
+            </h3>
+
+            <form onSubmit={handleSaveProfile} className="space-y-4 text-xs">
+              {/* Profile Photo Upload Block */}
+              <div className="flex flex-col items-center justify-center pb-4 border-b border-neutral-100 mb-2">
+                <div 
+                  onClick={() => editProfilePhotoInputRef.current?.click()}
+                  className="w-[130px] h-[130px] rounded-full relative overflow-visible mx-auto border border-neutral-200/80 shadow-lg bg-neutral-50/50 backdrop-blur-md group cursor-pointer hover:scale-[1.03] active:scale-[0.99] transition-all duration-300 flex items-center justify-center"
+                >
+                  <SafeAvatar
+                    name={editProfileName}
+                    photo={editProfilePhoto}
+                    className="w-full h-full animate-fade-in"
+                  />
+                  <div className="absolute bottom-1 right-1 bg-neutral-900 text-white hover:bg-black p-2.5 rounded-full border border-white shadow-md cursor-pointer hover:scale-110 active:scale-95 transition-all duration-200 shadow-black/15 flex items-center justify-center">
+                    <Camera size={14} />
+                  </div>
+                </div>
+
+                <div className="flex flex-col items-center gap-1.5 mt-3 text-center">
+                  <div className="flex gap-4">
+                    <button
+                      type="button"
+                      onClick={() => editProfilePhotoInputRef.current?.click()}
+                      className="text-[11px] font-bold uppercase tracking-wider text-neutral-800 hover:text-black transition-all hover:underline"
+                    >
+                      Change Photo
+                    </button>
+                    {editProfilePhoto && (
+                      <button
+                        type="button"
+                        onClick={() => setEditProfilePhoto('')}
+                        className="text-[11px] font-bold uppercase tracking-wider text-red-500 hover:text-red-700 transition-all hover:underline"
+                      >
+                        Remove Photo
+                      </button>
+                    )}
+                  </div>
+                  <span className="text-[9px] text-neutral-400 font-sans uppercase tracking-wider font-semibold">JPG or JPEG, max 5 MB</span>
+                </div>
+
+                <input
+                  type="file"
+                  ref={editProfilePhotoInputRef}
+                  onChange={(e) => {
+                    setEditProfileError('');
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+
+                    if (file.size > 5 * 1024 * 1024) {
+                      setEditProfileError('File size exceeds 5 MB.');
+                      return;
+                    }
+
+                    const fileName = file.name.toLowerCase();
+                    const isValid = file.type === 'image/jpeg' || fileName.endsWith('.jpg') || fileName.endsWith('.jpeg');
+                    if (!isValid) {
+                      setEditProfileError('Only JPG or JPEG images are allowed.');
+                      return;
+                    }
+
+                    const reader = new FileReader();
+                    reader.onload = (event) => {
+                      setEditProfilePhoto(event.target?.result as string);
+                    };
+                    reader.onerror = () => {
+                      setEditProfileError('Error reading file. Please try again.');
+                    };
+                    reader.readAsDataURL(file);
+                  }}
+                  accept="image/jpeg, image/jpg"
+                  className="hidden"
+                />
+              </div>
+
+              <div className="field">
+                <label className="text-[10px] font-mono uppercase text-neutral-400">Name</label>
+                <input
+                  type="text"
+                  value={editProfileName}
+                  onChange={(e) => setEditProfileName(e.target.value)}
+                  className="w-full p-2 border-b border-neutral-200 outline-none bg-neutral-50/50 mt-1 rounded-lg"
+                  required
+                />
+              </div>
+
+              <div className="field">
+                <label className="text-[10px] font-mono uppercase text-neutral-400">New Password (leave empty to keep current)</label>
+                <input
+                  type="password"
+                  value={editProfilePassword}
+                  onChange={(e) => setEditProfilePassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full p-2 border-b border-neutral-200 outline-none bg-neutral-50/50 mt-1 rounded-lg"
+                />
+              </div>
+
+              {editProfileError && (
+                <div className="text-[10px] text-red-500 font-medium p-2 bg-red-50/50 border border-red-100 rounded-xl text-center animate-fade-in">
+                  ⚠️ {editProfileError}
+                </div>
+              )}
+
+              {editProfileSuccess && (
+                <div className="text-[10px] text-green-600 font-medium p-2 bg-green-50/50 border border-green-100 rounded-xl text-center animate-fade-in">
+                  ✅ {editProfileSuccess}
+                </div>
+              )}
+
+              <div className="flex justify-end gap-3 pt-3 border-t border-neutral-100">
+                <button
+                  type="button"
+                  className="px-4 py-2 border border-neutral-200 text-neutral-600 hover:bg-neutral-50 rounded-xl transition-all"
+                  onClick={() => {
+                    setIsEditProfileModalOpen(false);
+                    setEditProfileError('');
+                    setEditProfileSuccess('');
+                    setEditProfilePassword('');
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-neutral-900 text-white hover:bg-black rounded-xl transition-all"
+                >
+                  Save Profile
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
