@@ -204,6 +204,7 @@ export default function WorkerDashboard({
 
   const chatImageRef = useRef<HTMLInputElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
 
   // Load chat sessions from database for current worker user
   const fetchSessions = async () => {
@@ -237,7 +238,9 @@ export default function WorkerDashboard({
   }, [currentUser]);
 
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (messagesContainerRef.current) {
+      messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+    }
   }, [activeSessionId, sessions, streamingText]);
 
   // Create Chat Session
@@ -545,6 +548,18 @@ export default function WorkerDashboard({
     setSidebarOpen(false);
   };
 
+  // Lock background scroll when mobile sidebar drawer is open
+  useEffect(() => {
+    if (isSidebarOpen) {
+      document.body.style.overflow = 'hidden';
+    } else {
+      document.body.style.overflow = '';
+    }
+    return () => {
+      document.body.style.overflow = '';
+    };
+  }, [isSidebarOpen]);
+
   const filteredSessions = sessions.filter(s => s.title.toLowerCase().includes(sessionSearch.toLowerCase()));
   const activeSession = sessions.find(s => s.id === activeSessionId);
 
@@ -681,23 +696,23 @@ export default function WorkerDashboard({
         </div>
 
         {/* WORK STAGE */}
-        <div className="stage flex-1 flex flex-col overflow-hidden min-w-0 pr-4 py-4">
-          <div className="stageHead glass-header mb-4 p-5 rounded-[20px] flex items-center justify-between border border-neutral-200/60 shadow-[0_4px_20px_-10px_rgba(0,0,0,0.03)]">
-            <div className="flex items-center gap-3">
+        <div className="stage flex-1 flex flex-col overflow-hidden min-w-0 p-2 sm:pr-4 sm:pl-0 sm:py-4">
+          <div className="stageHead glass-header mb-4 p-3.5 sm:p-5 rounded-[20px] flex items-center justify-between border border-neutral-200/60 shadow-[0_4px_20px_-10px_rgba(0,0,0,0.03)] w-full max-w-full">
+            <div className="flex items-center gap-2.5 sm:gap-3 min-w-0 flex-1">
               {/* Hamburger Button for Mobile */}
-              <button className="mobileMenuBtn p-2 rounded-xl border border-neutral-200 hover:bg-neutral-50" onClick={() => setSidebarOpen(true)}>
+              <button className="mobileMenuBtn p-2 rounded-xl border border-neutral-200 hover:bg-neutral-50 shrink-0" onClick={() => setSidebarOpen(true)}>
                 <Menu size={20} />
               </button>
 
-              <div>
-                <h1 id="workerTitle" className="font-sans tracking-tight font-bold text-lg text-neutral-900">
+              <div className="min-w-0 flex-1">
+                <h1 id="workerTitle" className="font-sans tracking-tight font-bold text-base sm:text-lg text-neutral-900 break-words leading-tight">
                   {activeTab === 'ask' && 'Ask the Operations Brain'}
                   {activeTab === 'docs' && 'Approved Operating SOPs'}
                   {activeTab === 'equipment' && 'Active Equipment Directory'}
                   {activeTab === 'report' && 'Raise Operational Issue'}
                   {activeTab === 'emergency' && 'Emergency Action Center'}
                 </h1>
-                <div className="sub text-[11px] text-neutral-400 font-sans mt-0.5" id="workerSub">
+                <div className="sub text-[10px] sm:text-[11px] text-neutral-400 font-sans mt-0.5 break-words" id="workerSub">
                   {activeTab === 'ask' && 'Real-time neural assistant for field compliance'}
                   {activeTab === 'docs' && 'Authorized plant guides, safety SOPs, and manual index'}
                   {activeTab === 'equipment' && 'Check locations, checklist requirements, and status logs'}
@@ -706,12 +721,12 @@ export default function WorkerDashboard({
                 </div>
               </div>
             </div>
-            <div className="badge hidden sm:flex font-mono text-[9px] font-bold border border-neutral-200 bg-neutral-50/50 text-neutral-500 tracking-widest uppercase px-3 py-1.5 rounded-full">
+            <div className="badge hidden sm:flex font-mono text-[9px] font-bold border border-neutral-200 bg-neutral-50/50 text-neutral-500 tracking-widest uppercase px-3 py-1.5 rounded-full shrink-0">
               Worker Console
             </div>
           </div>
 
-          <div className="stageBody flex-1 overflow-y-auto" id="workerBody">
+          <div className={`stageBody flex-1 min-h-0 flex flex-col ${activeTab === 'ask' ? 'overflow-hidden' : 'overflow-y-auto'}`} id="workerBody">
             {/* ASK VIEW - EXQUISITE DYNAMIC CHAT CANVAS */}
             {activeTab === 'ask' && (
               <div className="flex h-full glass-panel overflow-hidden border border-neutral-200/50 shadow-xl rounded-[24px]">
@@ -770,30 +785,30 @@ export default function WorkerDashboard({
                 </div>
 
                 {/* CONVERSATION AREA */}
-                <div className="flex-1 flex flex-col justify-between bg-neutral-50/15 backdrop-blur-sm relative">
-                  <div className="flex-1 overflow-y-auto p-5 space-y-6" style={{ WebkitOverflowScrolling: 'touch' }}>
+                <div className="flex-1 flex flex-col justify-between bg-neutral-50/15 backdrop-blur-sm relative min-w-0 w-full max-w-full overflow-hidden">
+                  <div ref={messagesContainerRef} className="flex-1 overflow-y-auto p-3 sm:p-5 space-y-4 sm:space-y-6 pb-20 sm:pb-8" style={{ WebkitOverflowScrolling: 'touch' }}>
                     {(!activeSession || activeSession.messages.length === 0) && !isStreaming ? (
-                      <div className="flex flex-col items-center justify-center h-full text-center max-w-lg mx-auto py-12">
+                      <div className="flex flex-col items-center justify-center h-full text-center max-w-lg mx-auto py-12 px-2">
                         <div className="mk w-12 h-12 mb-5 scale-125 bg-neutral-900 rounded-2xl flex items-center justify-center text-white font-black text-xs shadow-xl shadow-black/10">IB</div>
-                        <h2 className="text-lg font-sans font-extrabold text-neutral-900 mb-2">Worker Operations Brain</h2>
+                        <h2 className="text-base sm:text-lg font-sans font-extrabold text-neutral-900 mb-2">Worker Operations Brain</h2>
                         <p className="text-xs text-neutral-400 max-w-sm leading-relaxed">
                           Ask safety procedures, check conveyor status, inspect thermal logs, analyze control panels, or upload plant machine photos.
                         </p>
                       </div>
                     ) : (
-                      <div className="space-y-4">
+                      <div className="space-y-3 sm:space-y-4">
                         {activeSession?.messages.map((msg) => (
                           <div
                             key={msg.id}
-                            className={`flex gap-3.5 max-w-3xl ${msg.sender === 'me' ? 'ml-auto justify-end' : 'mr-auto justify-start'} animate-fadeIn`}
+                            className={`flex gap-2 sm:gap-3.5 w-full max-w-full ${msg.sender === 'me' ? 'ml-auto justify-end' : 'mr-auto justify-start'} animate-fadeIn`}
                           >
                             {msg.sender === 'bot' && (
                               <div className="w-6 h-6 shrink-0 mt-1.5 bg-neutral-900 rounded-lg flex items-center justify-center text-white text-[8px] font-bold shadow-md">IB</div>
                             )}
 
-                            <div className="space-y-1">
+                            <div className="space-y-1 min-w-0 max-w-[88%] sm:max-w-xl">
                               <div
-                                className={`p-4 rounded-2xl text-xs leading-relaxed max-w-xl shadow-[0_2px_12px_rgba(0,0,0,0.03)] border transition-all ${
+                                className={`p-3 sm:p-4 rounded-2xl text-xs leading-relaxed shadow-[0_2px_12px_rgba(0,0,0,0.03)] border transition-all break-words [overflow-wrap:anywhere] ${
                                   msg.sender === 'me'
                                     ? 'bg-neutral-900/90 text-white border-neutral-950 font-medium rounded-tr-sm'
                                     : msg.isWarning
@@ -806,20 +821,20 @@ export default function WorkerDashboard({
                               </div>
 
                               {msg.sender === 'bot' && (
-                                <div className="flex items-center gap-1.5 mt-1.5 text-[10px] font-mono text-neutral-400 pl-1">
+                                <div className="flex flex-wrap items-center gap-1.5 mt-1.5 text-[10px] font-mono text-neutral-400 pl-1 max-w-full">
                                   {msg.confidence !== undefined && (
-                                    <span className="bg-neutral-100 text-neutral-500 px-2 py-0.5 rounded-full font-medium">
+                                    <span className="bg-neutral-100 text-neutral-500 px-2 py-0.5 rounded-full font-medium shrink-0">
                                       Confidence: <b>{(msg.confidence * 100).toFixed(0)}%</b>
                                     </span>
                                   )}
                                   {msg.sourceDoc && (
-                                    <span className="bg-neutral-100 text-neutral-500 px-2 py-0.5 rounded-full font-medium">
-                                      Source: <b>{msg.sourceDoc}</b>
+                                    <span className="bg-neutral-100 text-neutral-500 px-2 py-0.5 rounded-full font-medium max-w-full break-all">
+                                      Source: <b className="truncate max-w-[150px] sm:max-w-none inline-block align-bottom">{msg.sourceDoc}</b>
                                     </span>
                                   )}
                                   <button
                                     onClick={() => handleSpeakText(msg.id, msg.text)}
-                                    className="hover:text-black p-1 bg-neutral-100 hover:bg-neutral-200/80 rounded-full transition-all"
+                                    className="hover:text-black p-1 bg-neutral-100 hover:bg-neutral-200/80 rounded-full transition-all shrink-0"
                                   >
                                     <Volume2 size={11} className={speakingMsgId === msg.id ? 'animate-pulse text-red-500' : ''} />
                                   </button>
@@ -838,27 +853,27 @@ export default function WorkerDashboard({
                         ))}
 
                         {aiState === 'pending' && !streamingText && (
-                          <div className="flex gap-3.5 max-w-3xl mr-auto justify-start animate-pulse">
+                          <div className="flex gap-2 sm:gap-3.5 w-full max-w-full mr-auto justify-start animate-pulse">
                             <div className="w-6 h-6 shrink-0 mt-1.5 bg-neutral-900 rounded-lg flex items-center justify-center text-white text-[8px] font-bold">IB</div>
-                            <div className="space-y-1">
-                              <div className="p-4 rounded-2xl rounded-tl-sm text-xs leading-relaxed max-w-xl shadow-[0_2px_12px_rgba(0,0,0,0.03)] border border-neutral-200/40 bg-white/80 text-neutral-500 backdrop-blur-md flex items-center gap-2">
+                            <div className="space-y-1 min-w-0 max-w-[88%] sm:max-w-xl">
+                              <div className="p-3 sm:p-4 rounded-2xl rounded-tl-sm text-xs leading-relaxed shadow-[0_2px_12px_rgba(0,0,0,0.03)] border border-neutral-200/40 bg-white/80 text-neutral-500 backdrop-blur-md flex items-center gap-2">
                                 <span className="flex space-x-1 shrink-0">
                                   <span className="w-1.5 h-1.5 bg-neutral-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
                                   <span className="w-1.5 h-1.5 bg-neutral-500 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
                                   <span className="w-1.5 h-1.5 bg-neutral-500 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
                                 </span>
-                                <span>Operations Brain is analyzing your request...</span>
+                                <span className="truncate">Analyzing request...</span>
                               </div>
                             </div>
                           </div>
                         )}
 
                         {isStreaming && streamingText && (
-                          <div className="flex gap-3.5 max-w-3xl mr-auto justify-start">
+                          <div className="flex gap-2 sm:gap-3.5 w-full max-w-full mr-auto justify-start">
                             <div className="w-6 h-6 shrink-0 mt-1.5 bg-neutral-900 rounded-lg flex items-center justify-center text-white text-[8px] font-bold animate-pulse">IB</div>
-                            <div className="space-y-1">
+                            <div className="space-y-1 min-w-0 max-w-[88%] sm:max-w-xl">
                               <div
-                                className={`p-4 rounded-2xl rounded-tl-sm text-xs leading-relaxed max-w-xl shadow-[0_2px_12px_rgba(0,0,0,0.03)] border bg-white/80 border-neutral-200/40 text-neutral-800 backdrop-blur-md`}
+                                className={`p-3 sm:p-4 rounded-2xl rounded-tl-sm text-xs leading-relaxed shadow-[0_2px_12px_rgba(0,0,0,0.03)] border bg-white/80 border-neutral-200/40 text-neutral-800 backdrop-blur-md break-words [overflow-wrap:anywhere]`}
                                 style={{ whiteSpace: 'pre-line' }}
                               >
                                 {streamingText}
@@ -869,12 +884,12 @@ export default function WorkerDashboard({
                         )}
 
                         {aiError && (
-                          <div className="flex gap-3.5 max-w-3xl mr-auto justify-start animate-fadeIn">
+                          <div className="flex gap-2 sm:gap-3.5 w-full max-w-full mr-auto justify-start animate-fadeIn">
                             <div className="w-6 h-6 shrink-0 mt-1.5 bg-red-600 rounded-lg flex items-center justify-center text-white text-[10px] font-bold shadow-md">⚠️</div>
-                            <div className="space-y-1">
-                              <div className="p-4 rounded-2xl rounded-tl-sm text-xs leading-relaxed max-w-xl shadow-[0_2px_12px_rgba(239,68,68,0.05)] border bg-red-50/90 border-red-200 text-red-900 backdrop-blur-md">
+                            <div className="space-y-1 min-w-0 max-w-[88%] sm:max-w-xl">
+                              <div className="p-3 sm:p-4 rounded-2xl rounded-tl-sm text-xs leading-relaxed shadow-[0_2px_12px_rgba(239,68,68,0.05)] border bg-red-50/90 border-red-200 text-red-900 backdrop-blur-md">
                                 <p className="font-semibold mb-1">Operations Interruption</p>
-                                <p className="text-red-700/90 mb-3 leading-relaxed">{aiError}</p>
+                                <p className="text-red-700/90 mb-3 leading-relaxed break-words">{aiError}</p>
                                 <button
                                   type="button"
                                   onClick={() => {
@@ -895,7 +910,7 @@ export default function WorkerDashboard({
                   </div>
 
                   {/* INPUT BAR */}
-                  <div className="p-4 border-t border-neutral-200/40 bg-white/65 backdrop-blur-md">
+                  <div className="p-2.5 sm:p-4 border-t border-neutral-200/40 bg-white/65 backdrop-blur-md w-full min-w-0 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
                     {speechError && (
                       <div className="text-[11px] text-red-600 bg-red-50/70 border border-red-100 px-3 py-1.5 rounded-xl mb-2 flex items-center justify-between font-medium">
                         <span className="flex items-center gap-1.5">⚠️ {speechError}</span>
@@ -904,8 +919,8 @@ export default function WorkerDashboard({
                     )}
 
                     {chatImageBase64 && (
-                      <div className="relative inline-block mb-3 border border-neutral-200/50 p-1.5 rounded-xl bg-white/80 shadow-md">
-                        <img src={chatImageBase64} alt="Upload preview" className="h-16 w-16 object-cover rounded-lg" />
+                      <div className="relative inline-block mb-2 border border-neutral-200/50 p-1.5 rounded-xl bg-white/80 shadow-md">
+                        <img src={chatImageBase64} alt="Upload preview" className="h-14 w-14 sm:h-16 sm:w-16 object-cover rounded-lg" />
                         <button
                           onClick={() => setChatImageBase64(null)}
                           className="absolute -top-2 -right-2 bg-neutral-900 text-white hover:bg-black rounded-full p-1 shadow-md transition-all text-[8px]"
@@ -915,10 +930,10 @@ export default function WorkerDashboard({
                       </div>
                     )}
 
-                    <form onSubmit={handleSendChat} className="flex gap-2 items-center border border-neutral-200/70 rounded-2xl p-1.5 shadow-[0_2px_12px_rgba(0,0,0,0.02)] bg-neutral-50/70 hover:bg-white focus-within:bg-white focus-within:ring-2 focus-within:ring-black/5 focus-within:border-neutral-900/30 transition-all duration-300">
+                    <form onSubmit={handleSendChat} className="flex gap-1.5 sm:gap-2 items-center border border-neutral-200/70 rounded-2xl p-1.5 shadow-[0_2px_12px_rgba(0,0,0,0.02)] bg-neutral-50/70 hover:bg-white focus-within:bg-white focus-within:ring-2 focus-within:ring-black/5 focus-within:border-neutral-900/30 transition-all duration-300 w-full min-w-0">
                       <input
                         type="text"
-                        className="flex-1 text-xs outline-none bg-transparent py-2 px-1 text-neutral-800"
+                        className="flex-1 min-w-0 text-xs outline-none bg-transparent py-2 px-1 text-neutral-800"
                         placeholder={
                           aiState === 'pending'
                             ? "Connecting to Operations Gateway..."
@@ -935,7 +950,7 @@ export default function WorkerDashboard({
                         type="button"
                         onClick={toggleSpeechRecognition}
                         disabled={aiState === 'pending' || aiState === 'streaming'}
-                        className={`p-2 rounded-xl transition-all ${
+                        className={`p-2 rounded-xl transition-all shrink-0 ${
                           isListening
                             ? 'bg-red-50 text-red-500 animate-pulse'
                             : (aiState === 'pending' || aiState === 'streaming')
