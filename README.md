@@ -35,6 +35,33 @@ Indus Brain AI helps industries quickly access equipment details, manuals, SOPs,
 
 `Google AI Studio` · `OpenRouter API` · `GitHub` · `Google Cloud`
 
+---
+
+## 🧪 Testing & Quality Assurance
+
+Indus Brain AI was tested using **TestSprite’s Autonomous AI Testing Agent** to evaluate the application’s frontend interface, navigation, forms, authentication, document-upload workflows, and core platform functionality.
+<div align="center">
+<br>
+
+[View Full Testing Report] <br>[Indus_Brain_AI_TestSprite_Selected_.pdf](https://github.com/user-attachments/files/30369192/Indus_Brain_AI_TestSprite_Selected_.pdf)
+
+</div>
+
+### Testing Summary
+
+| Test Information | Result |
+|---|---:|
+| Testing Date | 23 July 2026 |
+| Total Test Runs | 31 |
+| Reported Pass Rate | 100% |
+| Blocked Identified | 3 |
+| Issues Identified | 0 |
+| Testing Tool | TestSprite AI Testing Agent |
+
+> The complete automated testing results, tested scenarios, observations, and identified issues are available in the full testing report.
+
+---
+
 ## Team
 
 **Team Indus Brain AI**  
