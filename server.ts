@@ -1,6 +1,8 @@
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
+import bcrypt from 'bcryptjs';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
@@ -17,59 +19,92 @@ import {
   where 
 } from 'firebase/firestore';
 
+import { SECURITY_CONFIG } from './src/server/securityConfig.js';
+import { 
+  checkAuthRateLimit, 
+  recordFailedAuth, 
+  clearAuthRateLimit, 
+  createRateLimiter 
+} from './src/server/rateLimiter.js';
+import {
+  loginSchema,
+  logSchema,
+  accountActionSchema,
+  reportSchema,
+  documentUploadSchema,
+  documentActionSchema,
+  chatSessionActionSchema,
+  chatStreamSchema,
+  equipmentActionSchema,
+  emergencyUpdateSchema,
+  ttsSchema
+} from './src/server/validationSchemas.js';
+import { validateUploadedFile } from './src/server/fileSecurity.js';
+import { validatePasswordRules } from './src/utils/passwordSecurity.js';
+import {
+  applySecurityHeaders,
+  validateBody,
+  errorHandler,
+  logSecurityEvent
+} from './src/server/securityMiddleware.js';
+
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
 
+// Enable proxy trust for Cloud Run / reverse proxies
+app.set('trust proxy', 1);
+
+// Security Headers Middleware
+app.use(applySecurityHeaders);
+
 // Serve larger payloads for base64 images
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Custom in-memory request counter for rate limiting (Category [B])
-const ipRequestCounts = new Map<string, { count: number; resetTime: number }>();
-
-function rateLimiter(limit: number, windowMs: number) {
-  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    const ip = req.ip || req.headers['x-forwarded-for'] as string || 'unknown';
-    const now = Date.now();
-    const record = ipRequestCounts.get(ip);
-
-    if (!record || now > record.resetTime) {
-      ipRequestCounts.set(ip, { count: 1, resetTime: now + windowMs });
-      return next();
-    }
-
-    if (record.count >= limit) {
-      return res.status(429).json({
-        error: 'Too many requests. Please slow down and try again later.'
-      });
-    }
-
-    record.count++;
-    next();
-  };
-}
-
-// Security headers middleware (Category [F])
-app.use((req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
-  res.setHeader('X-XSS-Protection', '1; mode=block');
-  res.setHeader('Referrer-Policy', 'no-referrer');
-  res.setHeader('Content-Security-Policy', "default-src 'self' https:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; media-src 'self' data: https:; connect-src 'self' https:;");
-  next();
+// Rate Limiters based on sensitivity tiers
+const publicRateLimiter = createRateLimiter({
+  windowMs: SECURITY_CONFIG.PUBLIC_RATE_LIMIT_WINDOW_MS,
+  max: SECURITY_CONFIG.PUBLIC_RATE_LIMIT_MAX_REQUESTS
 });
+
+const userActionRateLimiter = createRateLimiter({
+  windowMs: SECURITY_CONFIG.USER_RATE_LIMIT_WINDOW_MS,
+  max: SECURITY_CONFIG.USER_RATE_LIMIT_MAX_REQUESTS
+});
+
+const sensitiveRateLimiter = createRateLimiter({
+  windowMs: SECURITY_CONFIG.SENSITIVE_RATE_LIMIT_WINDOW_MS,
+  max: SECURITY_CONFIG.SENSITIVE_RATE_LIMIT_MAX_REQUESTS
+});
+
+const guestRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: parseInt(process.env.DEMO_GUEST_LOGIN_LIMIT_PER_MINUTE || '20', 10)
+});
+
+const guestChatRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: parseInt(process.env.DEMO_GUEST_CHAT_LIMIT_PER_MINUTE || '10', 10)
+});
+
+function safeCompare(a: string, b: string): boolean {
+  const bufA = crypto.createHash('sha256').update(String(a)).digest();
+  const bufB = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(bufA, bufB);
+}
 
 // Server-side Authentication & RBAC middleware (Category [D])
 function verifyAuth(allowedRoles?: string[]) {
   return (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    if (req.method === 'GET' || req.path === '/api/auth/login') {
+    if (req.method === 'GET' || req.path === '/api/auth/login' || req.path === '/api/auth/guest-session' || req.path === '/api/auth/guest-login' || req.path === '/api/auth/guest-view') {
       return next();
     }
 
     const userId = req.headers['x-user-id'] as string;
     const userRole = req.headers['x-user-role'] as string;
+    const clientCredVer = req.headers['x-credentials-version'] as string;
 
     if (!userId || !userRole) {
       return res.status(401).json({ error: 'Unauthorized. Authentication credentials missing.' });
@@ -80,8 +115,22 @@ function verifyAuth(allowedRoles?: string[]) {
       return res.status(401).json({ error: 'Unauthorized. Session is invalid.' });
     }
 
+    if (clientCredVer && matchedUser.credentialsVersion) {
+      const verNum = parseInt(clientCredVer, 10);
+      if (!isNaN(verNum) && verNum < matchedUser.credentialsVersion) {
+        return res.status(401).json({ error: 'Unauthorized. Credentials have changed. Please log in again.' });
+      }
+    }
+
     if (matchedUser.role !== userRole) {
       return res.status(403).json({ error: 'Forbidden. Role mismatch detected.' });
+    }
+
+    if (userRole === 'DEMO_GUEST') {
+      const allowedGuestPaths = ['/api/chat', '/api/chat/sessions', '/api/chat/stream', '/api/voice/tts', '/api/data', '/api/logs', '/api/auth/guest-view'];
+      if (req.method !== 'GET' && !allowedGuestPaths.includes(req.path)) {
+        return res.status(403).json({ error: 'Forbidden. Guest users have read-only access.' });
+      }
     }
 
     if (allowedRoles && !allowedRoles.includes(userRole)) {
@@ -201,12 +250,26 @@ function tryParseJson(text: string) {
   }
 }
 
+const SALT_ROUNDS = 10;
+
+async function hashPassword(plainText: string): Promise<string> {
+  return await bcrypt.hash(plainText, SALT_ROUNDS);
+}
+
+async function verifyPassword(plainText: string, hashOrPlain: string): Promise<boolean> {
+  if (!hashOrPlain) return false;
+  if (/^\$2[aby]\$/.test(hashOrPlain)) {
+    return await bcrypt.compare(plainText, hashOrPlain);
+  }
+  return safeCompare(plainText, hashOrPlain);
+}
+
 
 // Initial Seed Data Setup
 function getInitialData() {
   return {
     accounts: [
-      { id: '80079385', password: '80079385', role: 'owner', name: 'Manager / Owner' },
+      { id: 'YASHOWN01', password: 'Y@SHOwn01', role: 'owner', name: 'Manager / Owner' },
     ],
     documents: [
       {
@@ -323,7 +386,7 @@ function getInitialData() {
       {
         photo: '',
         name: 'Manager / Owner',
-        employeeId: '80079385',
+        employeeId: 'YASHOWN01',
         department: 'Executive',
         role: 'owner',
         phone: '+91 98765 43210',
@@ -417,6 +480,35 @@ async function loadDBFromFirestore() {
       usersList.push({ id: doc.id, ...doc.data() });
     });
 
+    // Ensure old ID 80079385 is permanently purged from Firestore if it exists
+    const oldUserIndex = usersList.findIndex(u => u.id === '80079385');
+    if (oldUserIndex !== -1) {
+      await deleteDoc(doc(firestore, 'users', '80079385'));
+      usersList.splice(oldUserIndex, 1);
+    }
+
+    // Ensure Owner account YASHOWN01 exists in Firestore
+    const ownerDocMatch = usersList.find(u => u.id === 'YASHOWN01');
+    if (!ownerDocMatch) {
+      const hashedOwnerPassword = await hashPassword('Y@SHOwn01');
+      const ownerUserDoc: any = {
+        id: 'YASHOWN01',
+        name: 'Manager / Owner',
+        role: 'owner',
+        department: 'Executive',
+        email: 'owner@indusbrain.com',
+        employeeId: 'YASHOWN01',
+        createdAt: new Date().toISOString(),
+        password: hashedOwnerPassword,
+        credentialsVersion: Date.now(),
+        phone: '+91 98765 43210',
+        joiningDate: '2024-01-15',
+        status: 'Active'
+      };
+      await setDoc(doc(firestore, 'users', 'YASHOWN01'), ownerUserDoc);
+      usersList.push(ownerUserDoc);
+    }
+
     // 2. Fetch Equipment
     const equipmentSnap = await getDocs(collection(firestore, 'equipment'));
     let equipmentList: any[] = [];
@@ -490,7 +582,8 @@ async function loadDBFromFirestore() {
           employeeId: acc.id,
           photoUrl: (acc.photo && !acc.photo.includes('unsplash.com')) || (emp.photo && !emp.photo.includes('unsplash.com')) ? (acc.photo || emp.photo || '') : '',
           createdAt: new Date().toISOString(),
-          password: acc.password || acc.id,
+          password: await hashPassword(acc.password || acc.id),
+          credentialsVersion: Date.now(),
           phone: emp.phone || '+91 98765 43210',
           joiningDate: emp.joiningDate || new Date().toISOString().split('T')[0],
           status: emp.status || 'Active'
@@ -609,13 +702,30 @@ async function loadDBFromFirestore() {
       emergencyConfig = emergencyData;
     }
 
+    // Ensure guest account always exists for DEMO_GUEST sessions
+    if (!usersList.some((u: any) => u.id === 'guest')) {
+      usersList.push({
+        id: 'guest',
+        name: 'Guest Demo',
+        role: 'DEMO_GUEST',
+        department: 'Guest Demo',
+        email: 'guest@indusbrain.com',
+        photoUrl: '',
+        createdAt: new Date().toISOString(),
+        password: 'guest',
+        credentialsVersion: 1
+      });
+    }
+
     // Build standard structures expected by front-end client
     const accounts = usersList.map((u: any) => ({
       id: u.id,
       role: u.role,
       name: u.name,
       photo: (u.photoUrl && !u.photoUrl.includes('images.unsplash.com')) ? u.photoUrl : '',
-      password: u.password || u.id
+      password: u.password || u.id,
+      credentialsVersion: u.credentialsVersion,
+      mustChangePassword: Boolean(u.mustChangePassword)
     }));
 
     const employees = usersList.map((u: any) => ({
@@ -730,113 +840,317 @@ async function syncLocalDbFromFirestore() {
 syncLocalDbFromFirestore();
 
 // API Routes
-app.get('/api/data', rateLimiter(150, 60000), async (req, res) => {
-  await syncLocalDbFromFirestore();
-  // Category [A]: Strip passwords from the accounts payload returned to client browser
-  const safeDb = {
-    ...db,
-    accounts: (db.accounts || []).map((acc: any) => {
-      const { password, ...rest } = acc;
-      return rest;
-    })
-  };
-  res.json(safeDb);
+app.get('/api/data', publicRateLimiter, async (req, res, next) => {
+  try {
+    await syncLocalDbFromFirestore();
+    // Strip passwords from the accounts payload returned to client browser
+    const safeDb = {
+      ...db,
+      accounts: (db.accounts || []).map((acc: any) => {
+        const { password, ...rest } = acc;
+        return rest;
+      })
+    };
+    res.json(safeDb);
+  } catch (err) {
+    next(err);
+  }
 });
 
-// Secure Dedicated Login Route (Category [A] & [D])
-app.post('/api/auth/login', rateLimiter(20, 60000), async (req, res) => {
-  const { id, password } = req.body;
-  if (!id || typeof password !== 'string') {
-    return res.status(400).json({ error: 'Please enter both Employee ID and password.' });
+// Secure Dedicated Login Route
+app.post('/api/auth/login', sensitiveRateLimiter, validateBody(loginSchema), async (req, res, next) => {
+  try {
+    const { id, password } = req.body;
+    const cleanId = id.trim();
+
+    // Check rate limits with exponential backoff
+    const rateCheck = checkAuthRateLimit(req, cleanId);
+    if (!rateCheck.allowed) {
+      if (rateCheck.retryAfterSec) {
+        res.setHeader('Retry-After', String(rateCheck.retryAfterSec));
+      }
+      return res.status(429).json({
+        error: 'Too many login attempts. Please wait and try again.'
+      });
+    }
+
+    await syncLocalDbFromFirestore();
+    const matchedUser = db.accounts.find((a: any) => String(a.id).trim().toLowerCase() === cleanId.toLowerCase());
+
+    let isAuthenticated = false;
+    if (matchedUser && matchedUser.password) {
+      isAuthenticated = await verifyPassword(password, matchedUser.password);
+      if (isAuthenticated && !/^\$2[aby]\$/.test(matchedUser.password)) {
+        const hashedPassword = await hashPassword(password);
+        matchedUser.password = hashedPassword;
+        await setDoc(doc(firestore, 'users', matchedUser.id), { password: hashedPassword }, { merge: true });
+      }
+    } else {
+      // Dummy compare for constant time evaluation
+      await bcrypt.compare(password, '$2b$10$e8W/X2kX5f/a7b8c9d0e1uGz3H4I5J6K7L8M9N0O1P2Q3R4S5T6U7');
+    }
+
+    if (isAuthenticated) {
+      clearAuthRateLimit(req, cleanId);
+      logSecurityEvent('LOGIN_SUCCESS', { userId: matchedUser.id, role: matchedUser.role });
+
+      const safeUser = { ...matchedUser };
+      delete safeUser.password;
+      return res.json({ success: true, user: safeUser });
+    } else {
+      recordFailedAuth(req, cleanId);
+      logSecurityEvent('LOGIN_FAILURE', { attemptedId: cleanId });
+
+      return res.status(401).json({
+        error: 'Invalid employee ID or password.'
+      });
+    }
+  } catch (err) {
+    next(err);
   }
+});
 
-  await syncLocalDbFromFirestore();
-  const matchedUser = db.accounts.find((a: any) => a.id === id);
+// Guest Session Endpoint
+const handleGuestSession = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  try {
+    const isGuestEnabled = process.env.DEMO_GUEST_ENABLED !== 'false';
+    if (!isGuestEnabled) {
+      console.warn('[SERVER LOG] Guest Demo Mode requested but DEMO_GUEST_ENABLED is false');
+      return res.status(403).json({
+        success: false,
+        code: 'GUEST_MODE_DISABLED',
+        message: 'Guest Demo Mode is currently unavailable.',
+        error: 'Guest Demo Mode is currently unavailable.'
+      });
+    }
 
-  if (!matchedUser) {
-    return res.status(401).json({ error: 'Account not found.' });
+    const tenantId = process.env.DEMO_GUEST_TENANT_ID || 'guest-demo';
+    const guestUser = {
+      id: 'guest',
+      employeeId: 'GUEST',
+      name: 'Guest Demo',
+      displayName: 'Guest Demo',
+      role: 'DEMO_GUEST',
+      department: 'Guest Demo',
+      avatarUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=150&q=80',
+      tenantId: tenantId,
+      isDemo: true,
+      credentialsVersion: 1
+    };
+
+    // Ensure guest account exists in db.accounts for authorization lookups
+    const existingGuest = db.accounts.find((a: any) => a.id === 'guest');
+    if (!existingGuest) {
+      db.accounts.push(guestUser);
+    } else {
+      existingGuest.tenantId = tenantId;
+      existingGuest.role = 'DEMO_GUEST';
+    }
+
+    const sessionMinutes = parseInt(process.env.DEMO_GUEST_SESSION_MINUTES || '30', 10);
+    res.cookie('guest_session', 'active', {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: sessionMinutes * 60 * 1000,
+      path: '/'
+    });
+
+    console.log(`[SERVER LOG] Guest session initiated successfully for tenant: ${tenantId}`);
+    logSecurityEvent('GUEST_SESSION_CREATED', { role: 'DEMO_GUEST', tenantId });
+
+    const safeAccounts = (db.accounts || []).map((acc: any) => {
+      const { password, ...rest } = acc;
+      return rest;
+    });
+
+    return res.json({
+      success: true,
+      user: {
+        id: guestUser.id,
+        employeeId: guestUser.employeeId,
+        name: guestUser.name,
+        displayName: guestUser.displayName,
+        role: guestUser.role,
+        department: guestUser.department,
+        avatarUrl: guestUser.avatarUrl,
+        tenantId: guestUser.tenantId,
+        isDemo: guestUser.isDemo
+      },
+      redirectTo: '/guest/select-view',
+      accounts: safeAccounts,
+      employees: db.employees || []
+    });
+  } catch (err) {
+    console.error('[SERVER ERROR] Failed to create guest session:', err);
+    return res.status(500).json({
+      success: false,
+      code: 'GUEST_SESSION_ERROR',
+      message: 'Unable to start Guest Demo Mode. Please try again.',
+      error: 'Unable to start Guest Demo Mode. Please try again.'
+    });
   }
+};
 
-  if (matchedUser.password !== password) {
-    return res.status(401).json({ error: 'Incorrect password. Please check your credentials and try again.' });
+app.post('/api/auth/guest-session', guestRateLimiter, handleGuestSession);
+app.post('/api/auth/guest-login', guestRateLimiter, handleGuestSession);
+
+// Guest View Selection Endpoint
+app.post('/api/auth/guest-view', guestRateLimiter, async (req: express.Request, res: express.Response) => {
+  try {
+    const userRole = (req.headers['x-user-role'] as string) || (req.body && req.body.role);
+    const sessionCookie = req.cookies?.guest_session;
+    const isGuest = userRole === 'DEMO_GUEST' || sessionCookie === 'active';
+
+    if (!isGuest) {
+      return res.status(403).json({ success: false, error: 'Forbidden. Only DEMO_GUEST can select guest view.' });
+    }
+
+    const { view } = req.body || {};
+    if (!['WORKER', 'OWNER_MANAGER'].includes(view)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid guest view option. Must be WORKER or OWNER_MANAGER.'
+      });
+    }
+
+    const guestAcc = db.accounts.find((a: any) => a.id === 'guest');
+    if (guestAcc) {
+      guestAcc.demoView = view;
+    }
+
+    console.log(`[SERVER LOG] Guest selected demo view: ${view}`);
+    logSecurityEvent('GUEST_VIEW_SELECTED', { role: 'DEMO_GUEST', demoView: view });
+
+    return res.json({
+      success: true,
+      demoView: view,
+      redirectTo: view === 'WORKER' ? '/guest/worker' : '/guest/management'
+    });
+  } catch (err) {
+    console.error('[SERVER ERROR] Failed to update guest view:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error setting guest view.' });
   }
-
-  const safeUser = { ...matchedUser };
-  delete safeUser.password;
-  res.json({ success: true, user: safeUser });
 });
 
 // Logs Endpoint (authenticated users only)
-app.post('/api/logs', rateLimiter(100, 60000), verifyAuth(), async (req, res) => {
-  const { user, role, action } = req.body;
-  
-  // Category [C]: Validate input payloads
-  if (!validateName(user) || !validateName(role) || !validateName(action)) {
-    return res.status(400).json({ error: 'Invalid activity log parameters' });
+app.post('/api/logs', userActionRateLimiter, verifyAuth(), validateBody(logSchema), async (req, res, next) => {
+  try {
+    const { user, role, action } = req.body;
+    await addLogToFirestore(user, role, action);
+    await syncLocalDbFromFirestore();
+    res.json({ success: true, logs: db.logs });
+  } catch (err) {
+    next(err);
   }
-
-  await addLogToFirestore(user, role, action);
-  await syncLocalDbFromFirestore();
-  res.json({ success: true, logs: db.logs });
 });
 
+const MAX_WORKER_ACCOUNTS = 100;
+
 // Account CRUD (managers & owners only)
-app.post('/api/accounts', rateLimiter(100, 60000), verifyAuth(['owner', 'manager']), async (req, res) => {
-  const { action, account, targetId, currentUserId } = req.body;
+app.post('/api/accounts', sensitiveRateLimiter, verifyAuth(['owner', 'manager']), validateBody(accountActionSchema), async (req, res, next) => {
+  try {
+    const { action, account, targetId, currentUserId } = req.body;
+    const userRoleHeader = req.headers['x-user-role'] as string;
   
   if (action === 'add') {
-    if (!account || !validateId(account.id) || !validateName(account.name)) {
-      return res.status(400).json({ error: 'Invalid account ID or name formatting.' });
+    if (!account || !account.id || !account.name) {
+      return res.status(400).json({ error: 'Enter a valid Employee ID.' });
     }
+
+    const cleanId = String(account.id).trim();
+    const cleanName = String(account.name).trim();
+
+    if (!validateId(cleanId)) {
+      return res.status(400).json({ error: 'Enter a valid Employee ID.' });
+    }
+
+    if (!validateName(cleanName)) {
+      return res.status(400).json({ error: 'Enter a valid Employee ID.' });
+    }
+
     const allowedRoles = ['owner', 'manager', 'worker'];
     if (!allowedRoles.includes(account.role)) {
       return res.status(400).json({ error: 'Invalid role specified.' });
     }
 
-    const usersSnap = await getDocs(collection(firestore, 'users'));
-    let exists = false;
-    usersSnap.forEach(doc => {
-      if (doc.id.toLowerCase() === account.id.toLowerCase()) {
-        exists = true;
-      }
-    });
-
-    if (exists) {
-      return res.status(400).json({ error: 'ID already exists' });
+    if (userRoleHeader === 'manager' && account.role !== 'worker') {
+      return res.status(403).json({ error: 'You are not authorized to create employee accounts.' });
     }
 
+    const usersSnap = await getDocs(collection(firestore, 'users'));
+    const existingUsers: any[] = [];
+    usersSnap.forEach(doc => {
+      existingUsers.push({ id: doc.id, ...doc.data() });
+    });
+
+    // 1. Duplicate ID validation (case-insensitive & trimmed)
+    const normalizedNewId = cleanId.toLowerCase();
+    const duplicateExists = existingUsers.some(u => 
+      String(u.id || '').trim().toLowerCase() === normalizedNewId ||
+      String(u.employeeId || '').trim().toLowerCase() === normalizedNewId
+    );
+
+    if (duplicateExists) {
+      return res.status(400).json({ error: 'An account with this Employee ID already exists.' });
+    }
+
+    // 2. Maximum 100 worker accounts limit check
+    if (account.role === 'worker') {
+      const activeWorkerCount = existingUsers.filter(u => 
+        u.role === 'worker' && u.status !== 'Inactive'
+      ).length;
+
+      if (activeWorkerCount >= MAX_WORKER_ACCOUNTS) {
+        return res.status(400).json({ error: 'The maximum limit of 100 employee accounts has been reached.' });
+      }
+    }
+
+    const plainPw = (account.password && typeof account.password === 'string' && account.password.trim() !== '') 
+      ? account.password.trim() 
+      : cleanId;
+    const hashedPassword = await hashPassword(plainPw);
+
     const newUserDoc = {
-      id: account.id,
-      name: account.name,
+      id: cleanId,
+      name: cleanName,
       role: account.role,
       department: account.role === 'owner' ? 'Management' : account.role === 'manager' ? 'Operations' : 'Floor Staff',
-      email: `${account.name.toLowerCase().replace(/\s+/g, '')}@indusbrain.com`,
-      employeeId: account.id,
+      email: `${cleanName.toLowerCase().replace(/\s+/g, '')}@indusbrain.com`,
+      employeeId: cleanId,
       photoUrl: (account.photo && !account.photo.includes('images.unsplash.com') && typeof account.photo === 'string') ? account.photo : '',
       createdAt: new Date().toISOString(),
-      password: (account.password && typeof account.password === 'string') ? account.password : account.id,
+      password: hashedPassword,
+      credentialsVersion: Date.now(),
       phone: '+91 XXXXX XXXXX',
       joiningDate: new Date().toISOString().split('T')[0],
       status: 'Active'
     };
 
-    await setDoc(doc(firestore, 'users', account.id), newUserDoc);
-    await addLogToFirestore(currentUserId || 'Manager', 'manager', `Created account for ${account.name} (${account.id})`);
+    await setDoc(doc(firestore, 'users', cleanId), newUserDoc);
+    await addLogToFirestore(currentUserId || 'Manager', 'manager', `Created account for ${cleanName} (${cleanId})`);
     
     await syncLocalDbFromFirestore();
-    // Category [A]: Strip passwords from response payload
+
     const safeAccounts = (db.accounts || []).map((acc: any) => {
       const { password, ...rest } = acc;
       return rest;
     });
-    res.json({ success: true, accounts: safeAccounts, employees: db.employees });
+
+    return res.json({ success: true, accounts: safeAccounts, employees: db.employees });
   } else if (action === 'delete') {
     if (!validateId(targetId)) {
       return res.status(400).json({ error: 'Invalid target ID formatting.' });
     }
-    if (targetId === '80079385') {
-      return res.status(400).json({ error: 'Cannot delete permanent owner' });
+    
+    const targetAcc = (db.accounts || []).find((a: any) => a.id === targetId);
+    if (targetAcc && targetAcc.role === 'owner') {
+      const ownerCount = (db.accounts || []).filter((a: any) => a.role === 'owner').length;
+      if (ownerCount <= 1) {
+        return res.status(400).json({ error: 'Cannot delete the sole system owner account.' });
+      }
     }
+
     await deleteDoc(doc(firestore, 'users', targetId));
     await addLogToFirestore(currentUserId || 'Manager', 'manager', `Deleted account with ID: ${targetId}`);
 
@@ -850,37 +1164,217 @@ app.post('/api/accounts', rateLimiter(100, 60000), verifyAuth(['owner', 'manager
   } else {
     res.status(400).json({ error: 'Invalid action' });
   }
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Self Password Change Endpoint (For forced password change on next login)
+app.post('/api/auth/change-password', sensitiveRateLimiter, verifyAuth(), async (req, res, next) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    const userIdHeader = req.headers['x-user-id'] as string;
+
+    if (!currentPassword || !newPassword || typeof newPassword !== 'string') {
+      return res.status(400).json({ error: 'The password reset could not be completed.' });
+    }
+
+    const userRef = doc(firestore, 'users', userIdHeader);
+    const userSnap = await getDoc(userRef);
+    if (!userSnap.exists()) {
+      return res.status(404).json({ error: 'The password reset could not be completed.' });
+    }
+
+    const userData = userSnap.data();
+
+    // Verify current password
+    const isCurrentValid = await verifyPassword(currentPassword, userData.password);
+    if (!isCurrentValid) {
+      return res.status(401).json({ error: 'Incorrect current password.' });
+    }
+
+    // Validate rules
+    const ruleCheck = validatePasswordRules(newPassword.trim(), {
+      employeeId: userIdHeader,
+      name: userData.name,
+      phone: userData.phone,
+      email: userData.email
+    });
+
+    if (!ruleCheck.valid) {
+      return res.status(400).json({ error: 'The password does not meet the security requirements.' });
+    }
+
+    // Reuse check
+    if (userData.password && await verifyPassword(newPassword.trim(), userData.password)) {
+      return res.status(400).json({ error: 'The password does not meet the security requirements.' });
+    }
+    if (Array.isArray(userData.passwordHistory)) {
+      for (const oldHash of userData.passwordHistory) {
+        if (await verifyPassword(newPassword.trim(), oldHash)) {
+          return res.status(400).json({ error: 'The password does not meet the security requirements.' });
+        }
+      }
+    }
+
+    const newHash = await hashPassword(newPassword.trim());
+    const currentHistory = Array.isArray(userData.passwordHistory) ? [...userData.passwordHistory] : [];
+    if (userData.password) {
+      currentHistory.unshift(userData.password);
+    }
+
+    const updatedUser = {
+      ...userData,
+      password: newHash,
+      passwordHistory: currentHistory.slice(0, 5),
+      mustChangePassword: false,
+      credentialsVersion: Date.now()
+    };
+
+    await setDoc(userRef, updatedUser);
+
+    const logId = `LOG-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    await setDoc(doc(firestore, 'auditLogs', logId), {
+      logId,
+      userId: userIdHeader,
+      role: userData.role || 'worker',
+      action: 'password_change_self',
+      timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
+      sessionsRevoked: false
+    });
+
+    await syncLocalDbFromFirestore();
+
+    const safeAccounts = (db.accounts || []).map((acc: any) => {
+      const { password, passwordHistory, ...rest } = acc;
+      return rest;
+    });
+
+    res.json({
+      success: true,
+      message: 'Employee password updated successfully.',
+      user: { ...safeAccounts.find((a: any) => a.id === userIdHeader), mustChangePassword: false }
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Employee CRUD (authenticated users)
-app.post('/api/employees/update', rateLimiter(100, 60000), verifyAuth(), async (req, res) => {
-  const { employee, newPassword } = req.body;
-  const userIdHeader = req.headers['x-user-id'] as string;
-  const userRoleHeader = req.headers['x-user-role'] as string;
+app.post('/api/employees/update', sensitiveRateLimiter, verifyAuth(), async (req, res, next) => {
+  try {
+    const { employee, newPassword, newEmployeeId, requirePasswordChange, actingPassword } = req.body;
+    const userIdHeader = req.headers['x-user-id'] as string;
+    const userRoleHeader = req.headers['x-user-role'] as string;
 
-  if (!employee || !validateId(employee.employeeId)) {
-    return res.status(400).json({ error: 'Invalid employee ID formatting.' });
-  }
+    if (!employee || !validateId(employee.employeeId)) {
+      return res.status(400).json({ error: 'Invalid employee ID formatting.' });
+    }
 
-  // IDOR check: Users who are NOT managers/owners can ONLY update their own profile!
-  const isManagement = userRoleHeader === 'owner' || userRoleHeader === 'manager';
-  if (!isManagement && employee.employeeId !== userIdHeader) {
-    return res.status(403).json({ error: 'Forbidden. You are not permitted to modify other employees profiles.' });
-  }
+    const isManagement = userRoleHeader === 'owner' || userRoleHeader === 'manager';
 
-  const userRef = doc(firestore, 'users', employee.employeeId);
-  const userSnap = await getDoc(userRef);
+    // Password Reset Checks
+    if (newPassword && typeof newPassword === 'string' && newPassword.trim() !== '') {
+      // 1. Role Check: Only Owner and Manager accounts may reset a Worker's password
+      if (!isManagement) {
+        logSecurityEvent('UNAUTHORIZED_PASSWORD_RESET_ATTEMPT', {
+          actor: userIdHeader,
+          target: employee.employeeId
+        });
+        return res.status(403).json({ error: 'You are not authorized to reset this password.' });
+      }
 
-  if (userSnap.exists()) {
-    const existing = userSnap.data();
-    
+      // 2. Confirm Acting Owner/Manager password
+      if (!actingPassword) {
+        return res.status(401).json({ error: 'The password reset could not be completed.' });
+      }
+
+      const actingUser = (db.accounts || []).find((a: any) => a.id === userIdHeader);
+      if (!actingUser || !actingUser.password) {
+        return res.status(401).json({ error: 'The password reset could not be completed.' });
+      }
+
+      const isActingValid = await verifyPassword(actingPassword, actingUser.password);
+      if (!isActingValid) {
+        logSecurityEvent('PASSWORD_RESET_ACTING_AUTH_FAILED', { actor: userIdHeader });
+        return res.status(401).json({ error: 'The password reset could not be completed.' });
+      }
+
+      // 3. Password Rules Validation
+      const ruleCheck = validatePasswordRules(newPassword.trim(), {
+        employeeId: employee.employeeId,
+        name: employee.name,
+        phone: employee.phone,
+        email: employee.email
+      });
+
+      if (!ruleCheck.valid) {
+        return res.status(400).json({ error: 'The password does not meet the security requirements.' });
+      }
+
+      // 4. Reuse Check
+      const oldUserRef = doc(firestore, 'users', employee.employeeId);
+      const oldUserSnap = await getDoc(oldUserRef);
+      if (oldUserSnap.exists()) {
+        const userData = oldUserSnap.data();
+        if (userData.password && await verifyPassword(newPassword.trim(), userData.password)) {
+          return res.status(400).json({ error: 'The password does not meet the security requirements.' });
+        }
+        if (Array.isArray(userData.passwordHistory)) {
+          for (const oldHash of userData.passwordHistory) {
+            if (await verifyPassword(newPassword.trim(), oldHash)) {
+              return res.status(400).json({ error: 'The password does not meet the security requirements.' });
+            }
+          }
+        }
+      }
+    }
+
+    // IDOR check: Users who are NOT managers/owners can ONLY update their own profile!
+    if (!isManagement && employee.employeeId !== userIdHeader) {
+      return res.status(403).json({ error: 'Forbidden. You are not permitted to modify other employees profiles.' });
+    }
+
+    const oldId = employee.employeeId;
+    const oldUserRef = doc(firestore, 'users', oldId);
+    const oldUserSnap = await getDoc(oldUserRef);
+
+    if (!oldUserSnap.exists()) {
+      return res.status(404).json({ error: 'Employee record not found.' });
+    }
+
+    const existing = oldUserSnap.data();
+
     // If updating role and user is not a manager/owner, block it!
     if (!isManagement && employee.role && employee.role !== existing.role) {
       return res.status(403).json({ error: 'Forbidden. Non-administrative users cannot change roles.' });
     }
 
+    let targetId = oldId;
+    let idChanged = false;
+    let passwordChanged = false;
+
+    // Handle Employee ID change
+    if (newEmployeeId && typeof newEmployeeId === 'string' && newEmployeeId.trim() !== '' && newEmployeeId.trim() !== oldId) {
+      const cleanNewId = newEmployeeId.trim();
+      if (!validateId(cleanNewId)) {
+        return res.status(400).json({ error: 'Invalid new Employee ID formatting.' });
+      }
+      const targetSnap = await getDoc(doc(firestore, 'users', cleanNewId));
+      if (targetSnap.exists()) {
+        return res.status(400).json({ error: 'That Employee ID is already in use by another account.' });
+      }
+
+      // Permanently remove the old ID record from Firestore
+      await deleteDoc(oldUserRef);
+      targetId = cleanNewId;
+      idChanged = true;
+    }
+
     const updated: any = {
       ...existing,
+      id: targetId,
+      employeeId: targetId,
       name: validateName(employee.name) ? employee.name : existing.name,
       photoUrl: employee.photo !== undefined ? ((employee.photo && !employee.photo.includes('images.unsplash.com') && typeof employee.photo === 'string') ? employee.photo : '') : ((existing.photoUrl && !existing.photoUrl.includes('images.unsplash.com')) ? existing.photoUrl : ''),
       department: typeof employee.department === 'string' ? employee.department : (existing.department || ''),
@@ -889,170 +1383,338 @@ app.post('/api/employees/update', rateLimiter(100, 60000), verifyAuth(), async (
       email: validateEmail(employee.email) ? employee.email : (existing.email || ''),
       status: typeof employee.status === 'string' ? employee.status : (existing.status || 'Active')
     };
-    if (newPassword && typeof newPassword === 'string' && newPassword.trim() !== '') {
-      updated.password = newPassword;
-    }
-    await setDoc(userRef, updated);
-    await addLogToFirestore(employee.name || 'Employee', employee.role || 'worker', `Updated employee profile for ${employee.name}`);
-  }
 
-  await syncLocalDbFromFirestore();
-  // Strip passwords before responding
-  const safeAccounts = (db.accounts || []).map((acc: any) => {
-    const { password, ...rest } = acc;
-    return rest;
-  });
-  res.json({ success: true, employees: db.employees, accounts: safeAccounts });
+    if (newPassword && typeof newPassword === 'string' && newPassword.trim() !== '') {
+      const newHash = await hashPassword(newPassword.trim());
+      const currentHistory = Array.isArray(existing.passwordHistory) ? [...existing.passwordHistory] : [];
+      if (existing.password) {
+        currentHistory.unshift(existing.password);
+      }
+      updated.password = newHash;
+      updated.passwordHistory = currentHistory.slice(0, 5);
+      updated.mustChangePassword = Boolean(requirePasswordChange);
+      passwordChanged = true;
+    }
+
+    if (idChanged || passwordChanged) {
+      updated.credentialsVersion = Date.now();
+    }
+
+    // Write updated credentials/profile to target Firestore document
+    await setDoc(doc(firestore, 'users', targetId), updated);
+
+    if (passwordChanged) {
+      // Record audit log for password reset
+      const logId = `LOG-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+      await setDoc(doc(firestore, 'auditLogs', logId), {
+        logId,
+        userId: targetId,
+        role: existing.role || 'worker',
+        action: 'password_reset',
+        actingUserId: userIdHeader,
+        actingRole: userRoleHeader,
+        timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
+        sessionsRevoked: true,
+        requirePasswordChangeOnNextLogin: Boolean(requirePasswordChange)
+      });
+    } else {
+      await addLogToFirestore(employee.name || 'Employee', employee.role || 'worker', `Updated employee profile for ${employee.name} (${targetId})`);
+    }
+
+    await syncLocalDbFromFirestore();
+
+    // Strip passwords before responding
+    const safeAccounts = (db.accounts || []).map((acc: any) => {
+      const { password, passwordHistory, ...rest } = acc;
+      return rest;
+    });
+
+    res.json({ 
+      success: true, 
+      message: passwordChanged ? 'Employee password updated successfully.' : 'Employee profile updated successfully.',
+      employees: db.employees, 
+      accounts: safeAccounts, 
+      credentialsChanged: (idChanged || passwordChanged),
+      updatedId: targetId,
+      sessionsRevoked: passwordChanged,
+      mustChangePassword: Boolean(requirePasswordChange)
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Dedicated Password Reset Endpoint
+app.post('/api/employees/reset-password', sensitiveRateLimiter, verifyAuth(['owner', 'manager']), async (req, res, next) => {
+  try {
+    const { targetId, newPassword, requirePasswordChange, actingPassword } = req.body;
+    const userIdHeader = req.headers['x-user-id'] as string;
+    const userRoleHeader = req.headers['x-user-role'] as string;
+
+    if (!targetId || !validateId(targetId)) {
+      return res.status(400).json({ error: 'The password reset could not be completed.' });
+    }
+
+    if (!newPassword || typeof newPassword !== 'string' || !newPassword.trim()) {
+      return res.status(400).json({ error: 'The password does not meet the security requirements.' });
+    }
+
+    const isManagement = userRoleHeader === 'owner' || userRoleHeader === 'manager';
+    if (!isManagement) {
+      return res.status(403).json({ error: 'You are not authorized to reset this password.' });
+    }
+
+    if (!actingPassword) {
+      return res.status(401).json({ error: 'The password reset could not be completed.' });
+    }
+
+    const actingUser = (db.accounts || []).find((a: any) => a.id === userIdHeader);
+    if (!actingUser || !actingUser.password) {
+      return res.status(401).json({ error: 'The password reset could not be completed.' });
+    }
+
+    const isActingValid = await verifyPassword(actingPassword, actingUser.password);
+    if (!isActingValid) {
+      return res.status(401).json({ error: 'The password reset could not be completed.' });
+    }
+
+    const userRef = doc(firestore, 'users', targetId);
+    const userSnap = await getDoc(userRef);
+    if (!userSnap.exists()) {
+      return res.status(404).json({ error: 'The password reset could not be completed.' });
+    }
+
+    const userData = userSnap.data();
+
+    const ruleCheck = validatePasswordRules(newPassword.trim(), {
+      employeeId: targetId,
+      name: userData.name,
+      phone: userData.phone,
+      email: userData.email
+    });
+
+    if (!ruleCheck.valid) {
+      return res.status(400).json({ error: 'The password does not meet the security requirements.' });
+    }
+
+    if (userData.password && await verifyPassword(newPassword.trim(), userData.password)) {
+      return res.status(400).json({ error: 'The password does not meet the security requirements.' });
+    }
+    if (Array.isArray(userData.passwordHistory)) {
+      for (const oldHash of userData.passwordHistory) {
+        if (await verifyPassword(newPassword.trim(), oldHash)) {
+          return res.status(400).json({ error: 'The password does not meet the security requirements.' });
+        }
+      }
+    }
+
+    const newHash = await hashPassword(newPassword.trim());
+    const currentHistory = Array.isArray(userData.passwordHistory) ? [...userData.passwordHistory] : [];
+    if (userData.password) {
+      currentHistory.unshift(userData.password);
+    }
+
+    const updatedUser = {
+      ...userData,
+      password: newHash,
+      passwordHistory: currentHistory.slice(0, 5),
+      mustChangePassword: Boolean(requirePasswordChange),
+      credentialsVersion: Date.now()
+    };
+
+    await setDoc(userRef, updatedUser);
+
+    const logId = `LOG-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    await setDoc(doc(firestore, 'auditLogs', logId), {
+      logId,
+      userId: targetId,
+      role: userData.role || 'worker',
+      action: 'password_reset',
+      actingUserId: userIdHeader,
+      actingRole: userRoleHeader,
+      timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
+      sessionsRevoked: true,
+      requirePasswordChangeOnNextLogin: Boolean(requirePasswordChange)
+    });
+
+    await syncLocalDbFromFirestore();
+
+    const safeAccounts = (db.accounts || []).map((acc: any) => {
+      const { password, passwordHistory, ...rest } = acc;
+      return rest;
+    });
+
+    res.json({
+      success: true,
+      message: 'Employee password updated successfully.',
+      employees: db.employees,
+      accounts: safeAccounts,
+      sessionsRevoked: true,
+      mustChangePassword: Boolean(requirePasswordChange)
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Equipment CRUD (managers & owners only)
-app.post('/api/equipment', rateLimiter(100, 60000), verifyAuth(['owner', 'manager']), async (req, res) => {
-  const { action, equipment } = req.body;
-  if (!equipment || !validateId(equipment.id)) {
-    return res.status(400).json({ error: 'Invalid or missing equipment ID.' });
-  }
-  const eqId = equipment.id;
+app.post('/api/equipment', sensitiveRateLimiter, verifyAuth(['owner', 'manager']), validateBody(equipmentActionSchema), async (req, res, next) => {
+  try {
+    const { action, equipment } = req.body;
+    const eqId = equipment.id;
 
-  if (action === 'add') {
-    const eqDoc = {
-      machineId: equipment.id,
-      machineName: validateName(equipment.name) ? equipment.name : 'Unnamed Machine',
-      location: typeof equipment.location === 'string' ? equipment.location : '',
-      department: typeof equipment.department === 'string' ? equipment.department : '',
-      status: typeof equipment.status === 'string' ? equipment.status : 'Active',
-      associatedSop: typeof equipment.sop === 'string' ? equipment.sop : '',
-      notes: typeof equipment.notes === 'string' ? equipment.notes : '',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      manual: typeof equipment.manual === 'string' ? equipment.manual : '',
-      maintenanceHistory: Array.isArray(equipment.maintenanceHistory) ? equipment.maintenanceHistory : [],
-      lastService: typeof equipment.lastService === 'string' ? equipment.lastService : '',
-      nextService: typeof equipment.nextService === 'string' ? equipment.nextService : '',
-      sector: typeof equipment.sector === 'string' ? equipment.sector : '',
-      machineType: typeof equipment.machineType === 'string' ? equipment.machineType : '',
-      manualCategory: typeof equipment.manualCategory === 'string' ? equipment.manualCategory : '',
-      files: Array.isArray(equipment.files) ? equipment.files : []
-    };
-    await setDoc(doc(firestore, 'equipment', eqId), eqDoc);
-    await addLogToFirestore('Manager', 'manager', `Added new equipment: ${equipment.name}`);
-  } else if (action === 'edit') {
-    const eqDoc = {
-      machineId: equipment.id,
-      machineName: validateName(equipment.name) ? equipment.name : 'Unnamed Machine',
-      location: typeof equipment.location === 'string' ? equipment.location : '',
-      department: typeof equipment.department === 'string' ? equipment.department : '',
-      status: typeof equipment.status === 'string' ? equipment.status : 'Active',
-      associatedSop: typeof equipment.sop === 'string' ? equipment.sop : '',
-      notes: typeof equipment.notes === 'string' ? equipment.notes : '',
-      updatedAt: new Date().toISOString(),
-      manual: typeof equipment.manual === 'string' ? equipment.manual : '',
-      maintenanceHistory: Array.isArray(equipment.maintenanceHistory) ? equipment.maintenanceHistory : [],
-      lastService: typeof equipment.lastService === 'string' ? equipment.lastService : '',
-      nextService: typeof equipment.nextService === 'string' ? equipment.nextService : '',
-      sector: typeof equipment.sector === 'string' ? equipment.sector : '',
-      machineType: typeof equipment.machineType === 'string' ? equipment.machineType : '',
-      manualCategory: typeof equipment.manualCategory === 'string' ? equipment.manualCategory : '',
-      files: Array.isArray(equipment.files) ? equipment.files : []
-    };
-    await setDoc(doc(firestore, 'equipment', eqId), eqDoc);
-    await addLogToFirestore('Manager', 'manager', `Updated equipment details: ${equipment.name}`);
-  } else if (action === 'delete') {
-    await deleteDoc(doc(firestore, 'equipment', eqId));
-    await addLogToFirestore('Manager', 'manager', `Deleted equipment: ${equipment.name}`);
-  }
+    if (action === 'add') {
+      const eqDoc = {
+        machineId: equipment.id,
+        machineName: validateName(equipment.name) ? equipment.name : 'Unnamed Machine',
+        location: typeof equipment.location === 'string' ? equipment.location : '',
+        department: typeof equipment.department === 'string' ? equipment.department : '',
+        status: typeof equipment.status === 'string' ? equipment.status : 'Active',
+        associatedSop: typeof equipment.sop === 'string' ? equipment.sop : '',
+        notes: typeof equipment.notes === 'string' ? equipment.notes : '',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        manual: typeof equipment.manual === 'string' ? equipment.manual : '',
+        maintenanceHistory: Array.isArray(equipment.maintenanceHistory) ? equipment.maintenanceHistory : [],
+        lastService: typeof equipment.lastService === 'string' ? equipment.lastService : '',
+        nextService: typeof equipment.nextService === 'string' ? equipment.nextService : '',
+        sector: typeof equipment.sector === 'string' ? equipment.sector : '',
+        machineType: typeof equipment.machineType === 'string' ? equipment.machineType : '',
+        manualCategory: typeof equipment.manualCategory === 'string' ? equipment.manualCategory : '',
+        files: Array.isArray(equipment.files) ? equipment.files : []
+      };
+      await setDoc(doc(firestore, 'equipment', eqId), eqDoc);
+      await addLogToFirestore('Manager', 'manager', `Added new equipment: ${equipment.name}`);
+    } else if (action === 'update') {
+      const eqDoc = {
+        machineId: equipment.id,
+        machineName: validateName(equipment.name) ? equipment.name : 'Unnamed Machine',
+        location: typeof equipment.location === 'string' ? equipment.location : '',
+        department: typeof equipment.department === 'string' ? equipment.department : '',
+        status: typeof equipment.status === 'string' ? equipment.status : 'Active',
+        associatedSop: typeof equipment.sop === 'string' ? equipment.sop : '',
+        notes: typeof equipment.notes === 'string' ? equipment.notes : '',
+        updatedAt: new Date().toISOString(),
+        manual: typeof equipment.manual === 'string' ? equipment.manual : '',
+        maintenanceHistory: Array.isArray(equipment.maintenanceHistory) ? equipment.maintenanceHistory : [],
+        lastService: typeof equipment.lastService === 'string' ? equipment.lastService : '',
+        nextService: typeof equipment.nextService === 'string' ? equipment.nextService : '',
+        sector: typeof equipment.sector === 'string' ? equipment.sector : '',
+        machineType: typeof equipment.machineType === 'string' ? equipment.machineType : '',
+        manualCategory: typeof equipment.manualCategory === 'string' ? equipment.manualCategory : '',
+        files: Array.isArray(equipment.files) ? equipment.files : []
+      };
+      await setDoc(doc(firestore, 'equipment', eqId), eqDoc);
+      await addLogToFirestore('Manager', 'manager', `Updated equipment details: ${equipment.name}`);
+    } else if (action === 'delete') {
+      await deleteDoc(doc(firestore, 'equipment', eqId));
+      await addLogToFirestore('Manager', 'manager', `Deleted equipment: ${equipment.name}`);
+    }
 
-  await syncLocalDbFromFirestore();
-  res.json({ success: true, equipment: db.equipment });
+    await syncLocalDbFromFirestore();
+    res.json({ success: true, equipment: db.equipment });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Emergency Center Update (managers & owners only)
-app.post('/api/emergency', rateLimiter(100, 60000), verifyAuth(['owner', 'manager']), async (req, res) => {
-  const { emergency } = req.body;
-  if (!emergency) {
-    return res.status(400).json({ error: 'Missing emergency payload.' });
-  }
-
-  const emergencyData = {
-    fireProcedures: typeof emergency.fireProcedures === 'string' ? emergency.fireProcedures : '',
-    chemicalSpillSops: typeof emergency.chemicalSpillSops === 'string' ? emergency.chemicalSpillSops : '',
-    firstAid: typeof emergency.firstAid === 'string' ? emergency.firstAid : '',
-    emergencyShutdown: typeof emergency.emergencyShutdown === 'string' ? emergency.emergencyShutdown : '',
-    evacuationProcedures: typeof emergency.evacuationProcedures === 'string' ? emergency.evacuationProcedures : '',
-    assemblyPoints: typeof emergency.assemblyPoints === 'string' ? emergency.assemblyPoints : ''
-  };
-  await setDoc(doc(firestore, 'config', 'emergency'), emergencyData);
-
-  const contactsSnap = await getDocs(collection(firestore, 'emergencyContacts'));
-  for (const doc of contactsSnap.docs) {
-    await deleteDoc(doc.ref);
-  }
-
-  if (emergency.emergencyContacts && Array.isArray(emergency.emergencyContacts)) {
-    for (const c of emergency.emergencyContacts) {
-      if (!c.name || typeof c.name !== 'string') continue;
-      const contactId = `contact-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-      const contactDoc = {
-        name: c.name,
-        role: typeof c.role === 'string' ? c.role : '',
-        phone: typeof c.phone === 'string' ? c.phone : '',
-        type: 'emergency',
-        updatedAt: new Date().toISOString()
-      };
-      await setDoc(doc(firestore, 'emergencyContacts', contactId), contactDoc);
+app.post('/api/emergency', sensitiveRateLimiter, verifyAuth(['owner', 'manager']), validateBody(emergencyUpdateSchema), async (req, res, next) => {
+  try {
+    const { emergency } = req.body;
+    if (!emergency) {
+      return res.status(400).json({ error: 'Missing emergency payload.' });
     }
+
+    const emergencyData = {
+      fireProcedures: typeof emergency.fireProcedures === 'string' ? emergency.fireProcedures : '',
+      chemicalSpillSops: typeof emergency.chemicalSpillSops === 'string' ? emergency.chemicalSpillSops : '',
+      firstAid: typeof emergency.firstAid === 'string' ? emergency.firstAid : '',
+      emergencyShutdown: typeof emergency.emergencyShutdown === 'string' ? emergency.emergencyShutdown : '',
+      evacuationProcedures: typeof emergency.evacuationProcedures === 'string' ? emergency.evacuationProcedures : '',
+      assemblyPoints: typeof emergency.assemblyPoints === 'string' ? emergency.assemblyPoints : ''
+    };
+    await setDoc(doc(firestore, 'config', 'emergency'), emergencyData);
+
+    const contactsSnap = await getDocs(collection(firestore, 'emergencyContacts'));
+    for (const doc of contactsSnap.docs) {
+      await deleteDoc(doc.ref);
+    }
+
+    if (emergency.emergencyContacts && Array.isArray(emergency.emergencyContacts)) {
+      for (const c of emergency.emergencyContacts) {
+        if (!c.name || typeof c.name !== 'string') continue;
+        const contactId = `contact-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+        const contactDoc = {
+          name: c.name,
+          role: typeof c.role === 'string' ? c.role : '',
+          phone: typeof c.phone === 'string' ? c.phone : '',
+          type: 'emergency',
+          updatedAt: new Date().toISOString()
+        };
+        await setDoc(doc(firestore, 'emergencyContacts', contactId), contactDoc);
+      }
+    }
+
+    await addLogToFirestore('Manager', 'manager', 'Updated plant emergency protocols');
+    await syncLocalDbFromFirestore();
+    res.json({ success: true, emergency: db.emergency });
+  } catch (err) {
+    next(err);
   }
-
-  await addLogToFirestore('Manager', 'manager', 'Updated plant emergency protocols');
-
-  await syncLocalDbFromFirestore();
-  res.json({ success: true, emergency: db.emergency });
 });
 
 // Raise Worker Report (authenticated users only)
-app.post('/api/reports', rateLimiter(100, 60000), verifyAuth(), async (req, res) => {
-  const { report } = req.body;
-  if (!report || !validateId(report.id)) {
-    return res.status(400).json({ error: 'Invalid or missing report ID.' });
+app.post('/api/reports', userActionRateLimiter, verifyAuth(), validateBody(reportSchema), async (req, res, next) => {
+  try {
+    const { report } = req.body;
+    const repId = report.id;
+
+    if (report.photo) {
+      const imgSecurity = validateUploadedFile('photo.png', report.photo);
+      if (!imgSecurity.valid) {
+        return res.status(400).json({ error: imgSecurity.error || 'Invalid report photo uploaded.' });
+      }
+    }
+
+    const repDoc = {
+      reportId: repId,
+      type: typeof report.type === 'string' ? report.type : 'General',
+      machineId: '',
+      description: typeof report.description === 'string' ? report.description : '',
+      photoUrl: (report.photo && typeof report.photo === 'string') ? report.photo : '',
+      priority: 'Medium',
+      status: 'Open',
+      raisedBy: typeof report.workerName === 'string' ? report.workerName : 'Worker',
+      createdAt: typeof report.timestamp === 'string' ? report.timestamp : new Date().toISOString(),
+      reviewedBy: '',
+      reviewedAt: '',
+      title: validateName(report.title) ? report.title : 'Incident Report'
+    };
+
+    await setDoc(doc(firestore, 'reports', repId), repDoc);
+    await addLogToFirestore(report.workerName || 'Worker', 'worker', `Raised report: ${report.title}`);
+
+    await syncLocalDbFromFirestore();
+    res.json({ success: true, reports: db.reports });
+  } catch (err) {
+    next(err);
   }
-  const repId = report.id;
-
-  const repDoc = {
-    reportId: repId,
-    type: typeof report.type === 'string' ? report.type : 'General',
-    machineId: '',
-    description: typeof report.description === 'string' ? report.description : '',
-    photoUrl: (report.photo && typeof report.photo === 'string') ? report.photo : '',
-    priority: 'Medium',
-    status: 'Open',
-    raisedBy: typeof report.workerName === 'string' ? report.workerName : 'Worker',
-    createdAt: typeof report.timestamp === 'string' ? report.timestamp : new Date().toISOString(),
-    reviewedBy: '',
-    reviewedAt: '',
-    title: validateName(report.title) ? report.title : 'Incident Report'
-  };
-
-  await setDoc(doc(firestore, 'reports', repId), repDoc);
-  await addLogToFirestore(report.workerName || 'Worker', 'worker', `Raised report: ${report.title}`);
-
-  await syncLocalDbFromFirestore();
-  res.json({ success: true, reports: db.reports });
 });
 
 // Document Intelligence with Gemini
-app.post('/api/documents/upload', rateLimiter(20, 60000), verifyAuth(), async (req, res) => {
-  const { name, text, size, uploadedAt, version } = req.body;
-  const docId = `doc-${Date.now()}`;
+app.post('/api/documents/upload', sensitiveRateLimiter, verifyAuth(), validateBody(documentUploadSchema), async (req, res, next) => {
+  try {
+    const { name, text, size, uploadedAt, version } = req.body;
+    const docId = `doc-${Date.now()}`;
 
-  if (!name || typeof name !== 'string' || !text || typeof text !== 'string' || text.trim() === '') {
-    return res.status(400).json({ error: 'Document extraction failed. The uploaded file contains no readable text.' });
-  }
+    // Perform file security validation
+    const fileSecurity = validateUploadedFile(name, text);
+    if (!fileSecurity.valid) {
+      return res.status(400).json({ error: fileSecurity.error || 'Invalid uploaded file.' });
+    }
 
-  // Category [C]: Validate upload size (block files > 20MB of text strings)
-  if (text.length > 20000000) {
-    return res.status(400).json({ error: 'File content exceeds safe text processing threshold.' });
-  }
-
-  const cleanText = text || 'Empty document contents.';
+    const cleanText = text || 'Empty document contents.';
   
   let summary = 'Standard industrial procedural layout.';
   let safetyPoints: string[] = [];
@@ -1145,11 +1807,15 @@ app.post('/api/documents/upload', rateLimiter(20, 60000), verifyAuth(), async (r
   await addLogToFirestore('Operator', 'worker', `Uploaded document: ${name}`);
   await syncLocalDbFromFirestore();
   res.json({ success: true, documents: db.documents });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Update Document Version / Rename / Delete / Approve Workflow
-app.post('/api/documents/action', rateLimiter(100, 60000), verifyAuth(), async (req, res) => {
-  const { action, id, name, text, uploadedAt, status } = req.body;
+app.post('/api/documents/action', userActionRateLimiter, verifyAuth(), validateBody(documentActionSchema), async (req, res, next) => {
+  try {
+    const { action, id, name, text, uploadedAt, status } = req.body;
   if (!validateId(id)) {
     return res.status(400).json({ error: 'Invalid document ID.' });
   }
@@ -1206,12 +1872,16 @@ app.post('/api/documents/action', rateLimiter(100, 60000), verifyAuth(), async (
   await setDoc(docRef, existing);
   await syncLocalDbFromFirestore();
   res.json({ success: true, documents: db.documents });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Chat Session CRUD (authenticated users)
-app.post('/api/chat/sessions', rateLimiter(100, 60000), verifyAuth(), async (req, res) => {
-  const { action, userId, sessionId, title } = req.body;
-  const userIdHeader = req.headers['x-user-id'] as string;
+app.post('/api/chat/sessions', userActionRateLimiter, verifyAuth(), validateBody(chatSessionActionSchema), async (req, res, next) => {
+  try {
+    const { action, userId, sessionId, title } = req.body;
+    const userIdHeader = req.headers['x-user-id'] as string;
 
   if (!validateId(userId)) {
     return res.status(400).json({ error: 'Invalid user ID' });
@@ -1266,6 +1936,9 @@ app.post('/api/chat/sessions', rateLimiter(100, 60000), verifyAuth(), async (req
     return res.json({ success: true, sessions: db.chats[userId] || [] });
   }
   res.status(400).json({ error: 'Invalid chat action' });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Chunking and scoring helper functions for PS 8: Industrial Asset Intelligence
@@ -1335,8 +2008,16 @@ function scoreChunk(chunkText: string, docName: string, query: string): number {
   return score;
 }
 
+// Dynamic rate limiter for chat based on role (guest vs authenticated)
+const chatRateLimiter = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (req.headers['x-user-role'] === 'DEMO_GUEST') {
+    return guestChatRateLimiter(req, res, next);
+  }
+  return sensitiveRateLimiter(req, res, next);
+};
+
 // Chat streaming word-by-word with Gemini (authenticated users)
-app.post('/api/chat/stream', rateLimiter(20, 60000), verifyAuth(), async (req, res) => {
+app.post('/api/chat/stream', chatRateLimiter, verifyAuth(), validateBody(chatStreamSchema), async (req, res, next) => {
   const { userId, sessionId, message, imageBase64 } = req.body;
   const userIdHeader = req.headers['x-user-id'] as string;
   
@@ -1600,20 +2281,54 @@ Section 2: Conveyor Belt 2 System
 2.3 Any belt misalignment must be reported immediately to prevent friction-induced heat hazards.`
     };
 
-    // Synthesize/Ensure demo documents are loaded in the query context
-    const docList = [...(db.documents || [])];
-    for (const name of Object.keys(defaultDocTexts)) {
-      const exists = docList.some((d: any) => d.name === name);
-      if (!exists) {
-        docList.push({
-          id: `doc-demo-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-          name,
-          size: "3.8 MB",
-          chunks: 10,
-          status: "Approved",
-          text: defaultDocTexts[name],
-          uploadedAt: new Date().toISOString()
-        });
+    // Synthesize/Ensure demo documents are loaded in the query context based on user role
+    const userRole = req.headers['x-user-role'] as string;
+    let docList: any[] = [];
+
+    if (userRole === 'DEMO_GUEST') {
+      // Guest Demo Access: MUST ONLY access approved fictional demo content.
+      // Never access production records or user uploaded documents.
+      docList = Object.keys(defaultDocTexts).map(name => ({
+        id: `doc-demo-${name}`,
+        name,
+        size: "3.8 MB",
+        chunks: 10,
+        status: "Approved",
+        text: defaultDocTexts[name],
+        uploadedAt: new Date().toISOString()
+      }));
+    } else if (userRole === 'worker') {
+      // Worker Access: Only query approved operational documents
+      const approvedDocs = (db.documents || []).filter((d: any) => d.status === 'Approved');
+      docList = [...approvedDocs];
+      for (const name of Object.keys(defaultDocTexts)) {
+        if (!docList.some((d: any) => d.name === name)) {
+          docList.push({
+            id: `doc-demo-${name}`,
+            name,
+            size: "3.8 MB",
+            chunks: 10,
+            status: "Approved",
+            text: defaultDocTexts[name],
+            uploadedAt: new Date().toISOString()
+          });
+        }
+      }
+    } else {
+      // Manager / Owner Access: full access
+      docList = [...(db.documents || [])];
+      for (const name of Object.keys(defaultDocTexts)) {
+        if (!docList.some((d: any) => d.name === name)) {
+          docList.push({
+            id: `doc-demo-${name}`,
+            name,
+            size: "3.8 MB",
+            chunks: 10,
+            status: "Approved",
+            text: defaultDocTexts[name],
+            uploadedAt: new Date().toISOString()
+          });
+        }
       }
     }
 
@@ -1818,7 +2533,11 @@ Explain that Indus Brain AI connects: documents, SOPs, equipment data, maintenan
       } else if (matchedEquipment) {
         queryGuidance = `[DETERMINISTIC INSTRUCTION: The information is NOT in the uploaded documents, but it is available in the Equipment Registry. You MUST start your response with "I could not find this in the uploaded document. Based on the equipment registry," and end with "Source: Equipment Directory". Strictly use NO stars/bolding.]`;
       } else {
-        queryGuidance = `[DETERMINISTIC INSTRUCTION: The information is not found in documents or equipment registry. You MUST output exactly: "I could not find this information in the uploaded documents, SOPs, or equipment registry." and end with no other source.]`;
+        if (userRole === 'DEMO_GUEST') {
+          queryGuidance = `[DETERMINISTIC INSTRUCTION: The information is not found in demo documents or equipment registry. You MUST output exactly: "I could not find this information in the available demo documents." and end with no other source.]`;
+        } else {
+          queryGuidance = `[DETERMINISTIC INSTRUCTION: The information is not found in documents or equipment registry. You MUST output exactly: "I could not find this information in the uploaded documents, SOPs, or equipment registry." and end with no other source.]`;
+        }
       }
 
       finalPrompt = `${documentContext}\n\n${equipmentContext}\n\n${equipmentRegistryContext}\n\n${queryGuidance}\n\nUser Question:\n${message}`;
@@ -1925,9 +2644,9 @@ Explain that Indus Brain AI connects: documents, SOPs, equipment data, maintenan
   }
 });
 
-// Non-streaming chat endpoint (standard OpenAI compatibility)
-app.post('/api/chat', rateLimiter(20, 60000), verifyAuth(), async (req, res) => {
-  const { messages } = req.body;
+// Non-streaming chat endpoint (standard compatibility)
+app.post('/api/chat', chatRateLimiter, verifyAuth(), async (req, res, next) => {
+  const { messages, message, prompt } = req.body || {};
 
   try {
     const geminiClient = getGeminiClient();
@@ -1941,10 +2660,24 @@ app.post('/api/chat', rateLimiter(20, 60000), verifyAuth(), async (req, res) => 
         } else {
           geminiMessages.push({
             role: m.role === 'user' ? 'user' : 'model',
-            parts: [{ text: m.content }]
+            parts: [{ text: m.content || m.text || '' }]
           });
         }
       }
+    } else if (typeof message === 'string' && message.trim()) {
+      geminiMessages.push({
+        role: 'user',
+        parts: [{ text: message }]
+      });
+    } else if (typeof prompt === 'string' && prompt.trim()) {
+      geminiMessages.push({
+        role: 'user',
+        parts: [{ text: prompt }]
+      });
+    }
+
+    if (geminiMessages.length === 0) {
+      return res.status(400).json({ error: 'Message content cannot be empty.' });
     }
 
     const response = await generateContentWithFallback(geminiClient, {
@@ -1953,12 +2686,17 @@ app.post('/api/chat', rateLimiter(20, 60000), verifyAuth(), async (req, res) => 
       config: systemInstruction ? { systemInstruction } : undefined
     });
 
+    const replyText = (response.text || '').replace(/\*\*/g, '').replace(/\*/g, '');
+
     const completionResponse = {
+      success: true,
+      answer: replyText,
+      message: replyText,
       choices: [
         {
           message: {
             role: 'assistant',
-            content: response.text || ''
+            content: replyText
           }
         }
       ]
@@ -1975,11 +2713,8 @@ app.post('/api/chat', rateLimiter(20, 60000), verifyAuth(), async (req, res) => 
 });
 
 // Gemini TTS Generation for Voice assistant
-app.post('/api/voice/tts', rateLimiter(20, 60000), verifyAuth(), async (req, res) => {
+app.post('/api/voice/tts', sensitiveRateLimiter, verifyAuth(), validateBody(ttsSchema), async (req, res, next) => {
   const { text } = req.body;
-  if (!text || typeof text !== 'string') {
-    return res.status(400).json({ error: 'Missing or invalid text parameter' });
-  }
 
   try {
     const geminiClient = getGeminiClient();
@@ -2009,6 +2744,9 @@ app.post('/api/voice/tts', rateLimiter(20, 60000), verifyAuth(), async (req, res
 });
 
 async function startServer() {
+  // Mount Centralized Error Handling Middleware
+  app.use(errorHandler);
+
   // Setup dev server or static file server
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({

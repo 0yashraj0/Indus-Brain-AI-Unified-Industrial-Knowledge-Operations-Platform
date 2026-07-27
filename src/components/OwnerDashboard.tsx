@@ -2,11 +2,12 @@ import React, { useState, useRef, useEffect } from 'react';
 import {
   Menu, X, Search, Trash2, Edit, Plus, Check, FileText, Settings, Activity,
   ShieldAlert, Wrench, Users, Download, BarChart2, Mic, Volume2, VolumeX,
-  Upload, History, Clock, ArrowRight, Eye, CheckCircle, XCircle, AlertTriangle,
-  Play, Pause, RefreshCw, Layers, Calendar, Camera
+  Upload, History, Clock, ArrowRight, Eye, EyeOff, CheckCircle, XCircle, AlertTriangle,
+  Play, Pause, RefreshCw, Layers, Calendar, Camera, Lock, Key, Copy
 } from 'lucide-react';
 import { Account, Document, WorkerReport, ChatMessage, Equipment, Employee, ActivityLog, EmergencyData, ChatSession } from '../types';
 import { extractTextFromFile } from '../utils/fileExtractor';
+import { validatePasswordRules, generateCompliantTempPassword } from '../utils/passwordSecurity';
 
 interface OwnerDashboardProps {
   currentUser: Account;
@@ -17,9 +18,9 @@ interface OwnerDashboardProps {
   employees: Employee[];
   logs: ActivityLog[];
   emergency: EmergencyData;
-  onAddAccount: (acc: Account) => Promise<boolean>;
+  onAddAccount: (acc: Account) => Promise<{ success: boolean; error?: string } | boolean>;
   onDeleteAccount: (targetId: string, currentUserId: string) => Promise<boolean>;
-  onUpdateEmployee: (emp: Employee, newPassword?: string) => Promise<void>;
+  onUpdateEmployee: (emp: Employee, newPassword?: string, newEmployeeId?: string, requirePasswordChange?: boolean, actingPassword?: string) => Promise<any>;
   onAddDocument: (doc: Document) => Promise<void>;
   onDeleteDocument: (id: string) => Promise<void>;
   onRenameDocument: (id: string, newName: string) => Promise<void>;
@@ -30,6 +31,7 @@ interface OwnerDashboardProps {
   onDeleteEquipment: (eq: Equipment) => Promise<void>;
   onUpdateEmergency: (em: EmergencyData) => Promise<void>;
   onSignOut: () => void;
+  onChangeGuestView?: () => void;
 }
 
 type OwnerTab = 'ask' | 'docs' | 'analytics' | 'equipment' | 'reports' | 'accounts' | 'logs' | 'emergency';
@@ -89,10 +91,13 @@ export default function OwnerDashboard({
   onEditEquipment,
   onDeleteEquipment,
   onUpdateEmergency,
-  onSignOut
+  onSignOut,
+  onChangeGuestView
 }: OwnerDashboardProps) {
   const [activeTab, setActiveTab] = useState<OwnerTab>('ask');
   const [isSidebarOpen, setSidebarOpen] = useState(false);
+
+  const isGuest = currentUser.role === 'DEMO_GUEST';
 
   const currentUserEmployee = employees.find(emp => emp.employeeId === currentUser.id);
   const currentUserPhoto = currentUserEmployee?.photo || '';
@@ -154,6 +159,18 @@ export default function OwnerDashboard({
   const [editingEmployee, setEditingEmployee] = useState<Employee | null>(null);
   const [isEmployeeFormOpen, setIsEmployeeFormOpen] = useState(false);
 
+  // Password Reset States
+  const [resetNewPassword, setResetNewPassword] = useState('');
+  const [resetConfirmPassword, setResetConfirmPassword] = useState('');
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [requirePasswordChangeNextLogin, setRequirePasswordChangeNextLogin] = useState(false);
+  const [actingManagerPassword, setActingManagerPassword] = useState('');
+  const [resetPasswordError, setResetPasswordError] = useState('');
+  const [generatedTempPasswordModal, setGeneratedTempPasswordModal] = useState<string | null>(null);
+  const [copiedTempPassword, setCopiedTempPassword] = useState(false);
+  const [tempPasswordPending, setTempPasswordPending] = useState<string | null>(null);
+
   // Emergency Form states
   const [isEditingEmergency, setIsEditingEmergency] = useState(false);
   const [emFire, setEmFire] = useState(emergency.fireProcedures);
@@ -185,6 +202,7 @@ export default function OwnerDashboard({
   // Edit Profile Modal state for current Owner/Manager
   const [isEditProfileModalOpen, setIsEditProfileModalOpen] = useState(false);
   const [editProfileName, setEditProfileName] = useState(currentUser.name);
+  const [editProfileId, setEditProfileId] = useState(currentUser.id);
   const [editProfilePhoto, setEditProfilePhoto] = useState('');
   const [editProfilePassword, setEditProfilePassword] = useState('');
   const [editProfileError, setEditProfileError] = useState('');
@@ -193,6 +211,7 @@ export default function OwnerDashboard({
 
   useEffect(() => {
     setEditProfileName(currentUser.name);
+    setEditProfileId(currentUser.id);
     if (currentUserEmployee) {
       setEditProfilePhoto(currentUserEmployee.photo || '');
     }
@@ -272,6 +291,7 @@ export default function OwnerDashboard({
   };
 
   const canEditContact = (idx: number) => {
+    if (isGuest) return false;
     if (currentUser.role === 'owner') {
       return true;
     }
@@ -512,13 +532,13 @@ export default function OwnerDashboard({
       const controller = new AbortController();
       let timer = setTimeout(() => {
         controller.abort();
-      }, 15000);
+      }, 60000);
 
       const resetTimer = () => {
         clearTimeout(timer);
         timer = setTimeout(() => {
           controller.abort();
-        }, 15000);
+        }, 60000);
       };
 
       const res = await fetch('/api/chat/stream', {
@@ -532,7 +552,7 @@ export default function OwnerDashboard({
           userId: currentUser.id,
           sessionId: targetSid,
           message: messageText,
-          imageBase64: chatImageBase64
+          imageBase64: chatImageBase64 || undefined
         }),
         signal: controller.signal
       });
@@ -561,6 +581,7 @@ export default function OwnerDashboard({
       }
 
       let buffer = '';
+      let isDone = false;
       while (true) {
         const { value, done } = await reader.read();
         resetTimer(); // Reset watchdog timer on receiving data
@@ -585,6 +606,7 @@ export default function OwnerDashboard({
             if (parsed.error) {
               setAiError(parsed.error);
               setAiState('error');
+              isDone = true;
             } else if (parsed.text !== undefined) {
               setStreamingText(parsed.text);
               if (parsed.isWarning) {
@@ -598,13 +620,21 @@ export default function OwnerDashboard({
               setIsStreaming(false);
               setStreamingText('');
               setAiState('idle');
+              isDone = true;
             }
           } catch (e) {
             // ignore JSON parse errors of incomplete chunk boundaries
           }
         }
+        if (isDone) break;
       }
       clearTimeout(timer);
+      if (!isDone) {
+        await fetchSessions();
+        setIsStreaming(false);
+        setStreamingText('');
+        setAiState('idle');
+      }
     } catch (err: any) {
       console.error('Streaming error:', err);
       setIsStreaming(false);
@@ -785,7 +815,7 @@ export default function OwnerDashboard({
       return;
     }
 
-    const success = await onAddAccount({
+    const result = await onAddAccount({
       id: cleanId,
       name: cleanName,
       password: cleanPw,
@@ -793,7 +823,12 @@ export default function OwnerDashboard({
       photo: newPhoto,
     });
 
-    if (success) {
+    const isSuccess = typeof result === 'boolean' ? result : result?.success;
+    const errorMsg = typeof result === 'object' && result?.error
+      ? result.error
+      : 'The employee account could not be created. Please try again.';
+
+    if (isSuccess) {
       setAccountMsg({
         text: `Account "${cleanId}" successfully created.`,
         isError: false,
@@ -804,7 +839,7 @@ export default function OwnerDashboard({
       setNewPhoto('');
       setNewPhotoError('');
     } else {
-      setAccountMsg({ text: 'That ID is already taken.', isError: true });
+      setAccountMsg({ text: errorMsg, isError: true });
     }
   };
 
@@ -937,9 +972,33 @@ export default function OwnerDashboard({
 
   // Open Employee editing
   const openEmployeeForm = (emp: Employee) => {
-    setEditingEmployee(emp);
+    setEditingEmployee({ ...emp });
     setIsEmployeeFormOpen(true);
     setProfileUploadError('');
+    setResetNewPassword('');
+    setResetConfirmPassword('');
+    setShowNewPassword(false);
+    setShowConfirmPassword(false);
+    setRequirePasswordChangeNextLogin(false);
+    setActingManagerPassword('');
+    setResetPasswordError('');
+    setTempPasswordPending(null);
+  };
+
+  const handleGenerateTempPassword = () => {
+    if (!editingEmployee) return;
+    const tempPw = generateCompliantTempPassword({
+      employeeId: editingEmployee.employeeId,
+      name: editingEmployee.name,
+      phone: editingEmployee.phone,
+      email: editingEmployee.email
+    });
+    setResetNewPassword(tempPw);
+    setResetConfirmPassword(tempPw);
+    setShowNewPassword(true);
+    setShowConfirmPassword(true);
+    setTempPasswordPending(tempPw);
+    setResetPasswordError('');
   };
 
   const handleProfilePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -979,9 +1038,58 @@ export default function OwnerDashboard({
 
   const saveEmployee = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (editingEmployee) {
-      await onUpdateEmployee(editingEmployee);
+    if (!editingEmployee) return;
+    setResetPasswordError('');
+
+    const hasPasswordInput = Boolean(resetNewPassword.trim() || resetConfirmPassword.trim() || actingManagerPassword.trim());
+
+    if (hasPasswordInput) {
+      if (resetNewPassword !== resetConfirmPassword) {
+        setResetPasswordError('New Password and Confirm New Password must match.');
+        return;
+      }
+
+      const ruleCheck = validatePasswordRules(resetNewPassword, {
+        employeeId: editingEmployee.employeeId,
+        name: editingEmployee.name,
+        phone: editingEmployee.phone,
+        email: editingEmployee.email
+      });
+
+      if (!ruleCheck.valid) {
+        setResetPasswordError(ruleCheck.error || 'The password does not meet the security requirements.');
+        return;
+      }
+
+      if (!actingManagerPassword.trim()) {
+        setResetPasswordError('Please enter your Owner/Manager password to confirm the password reset.');
+        return;
+      }
+    }
+
+    try {
+      await onUpdateEmployee(
+        editingEmployee,
+        hasPasswordInput ? resetNewPassword.trim() : undefined,
+        undefined,
+        hasPasswordInput ? requirePasswordChangeNextLogin : undefined,
+        hasPasswordInput ? actingManagerPassword.trim() : undefined
+      );
+
+      if (hasPasswordInput && tempPasswordPending) {
+        setGeneratedTempPasswordModal(tempPasswordPending);
+        setTempPasswordPending(null);
+      }
+
       setIsEmployeeFormOpen(false);
+      setResetNewPassword('');
+      setResetConfirmPassword('');
+      setActingManagerPassword('');
+      setRequirePasswordChangeNextLogin(false);
+      setShowNewPassword(false);
+      setShowConfirmPassword(false);
+    } catch (err: any) {
+      setResetPasswordError(err.message || 'Failed to update employee profile.');
     }
   };
 
@@ -992,8 +1100,10 @@ export default function OwnerDashboard({
     setEditProfileSuccess('');
 
     const cleanName = editProfileName.trim();
-    if (!cleanName) {
-      setEditProfileError('Name cannot be empty.');
+    const cleanId = editProfileId.trim();
+
+    if (!cleanName || !cleanId) {
+      setEditProfileError('Name and Employee ID cannot be empty.');
       return;
     }
 
@@ -1010,7 +1120,8 @@ export default function OwnerDashboard({
     };
 
     try {
-      await onUpdateEmployee(updatedEmployee, editProfilePassword || undefined);
+      const newEmpId = cleanId !== currentUser.id ? cleanId : undefined;
+      await onUpdateEmployee(updatedEmployee, editProfilePassword || undefined, newEmpId);
       setEditProfileSuccess('Profile successfully updated!');
       setEditProfilePassword('');
       // Auto close modal after a short delay
@@ -1018,8 +1129,8 @@ export default function OwnerDashboard({
         setIsEditProfileModalOpen(false);
         setEditProfileSuccess('');
       }, 1500);
-    } catch (err) {
-      setEditProfileError('Failed to update profile.');
+    } catch (err: any) {
+      setEditProfileError(err?.message || 'Failed to update profile.');
     }
   };
 
@@ -1118,19 +1229,21 @@ export default function OwnerDashboard({
 
           <div className="idBlock mb-8 pb-6 border-b border-white/5 flex items-center gap-3">
             <div 
-              onClick={() => setIsEditProfileModalOpen(true)}
-              className="group relative cursor-pointer shrink-0"
-              title="Click to edit profile"
+              onClick={() => { if (!isGuest) setIsEditProfileModalOpen(true); }}
+              className={`group relative shrink-0 ${!isGuest ? 'cursor-pointer' : ''}`}
+              title={!isGuest ? "Click to edit profile" : undefined}
             >
               <SafeAvatar
                 name={currentUser.name}
                 photo={currentUserEmployee?.photo}
                 className="w-10 h-10 border border-white/10 shadow-lg group-hover:opacity-75 transition-all"
               />
-              {/* Overlay edit icon */}
-              <div className="absolute inset-0 bg-black/40 rounded-full opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity duration-200">
-                <Camera size={12} className="text-white" />
-              </div>
+              {!isGuest && (
+                /* Overlay edit icon */
+                <div className="absolute inset-0 bg-black/40 rounded-full opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity duration-200">
+                  <Camera size={12} className="text-white" />
+                </div>
+              )}
             </div>
             <div>
               <div className="who text-[9px] uppercase tracking-widest text-neutral-500 font-bold mb-0.5">Signed in as</div>
@@ -1138,7 +1251,7 @@ export default function OwnerDashboard({
                 {currentUser.name}
               </div>
               <div className="rl uppercase tracking-widest text-[8px] text-white/45 font-mono mt-0.5">
-                {currentUser.role} console
+                {currentUser.role === 'DEMO_GUEST' ? 'Guest Demo' : `${currentUser.role} console`}
               </div>
             </div>
           </div>
@@ -1304,8 +1417,18 @@ export default function OwnerDashboard({
                 </div>
               </div>
             </div>
-            <div className="badge hidden sm:flex font-mono text-[9px] font-bold border border-neutral-200 bg-neutral-900 text-white tracking-widest uppercase px-3 py-1.5 rounded-full shadow-[0_4px_12px_rgba(0,0,0,0.1)] shrink-0">
-              {currentUser.role} Control
+            <div className="flex items-center gap-2 shrink-0">
+              {isGuest && onChangeGuestView && (
+                <button
+                  onClick={onChangeGuestView}
+                  className="px-3 py-1.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 rounded-full text-[10px] font-mono font-bold uppercase transition-all cursor-pointer flex items-center gap-1.5"
+                >
+                  <Lock size={12} /> Switch Demo View
+                </button>
+              )}
+              <div className="badge hidden sm:flex font-mono text-[9px] font-bold border border-neutral-200 bg-neutral-900 text-white tracking-widest uppercase px-3 py-1.5 rounded-full shadow-[0_4px_12px_rgba(0,0,0,0.1)]">
+                {currentUser.role === 'DEMO_GUEST' ? 'Guest Demo (Owner + Manager)' : `${currentUser.role} Control`}
+              </div>
             </div>
           </div>
 
@@ -1589,28 +1712,32 @@ export default function OwnerDashboard({
             {/* DOCUMENTS VIEW */}
             {activeTab === 'docs' && (
               <div className="space-y-6">
-                <input
-                  type="file"
-                  ref={fileInputRef}
-                  className="hidden"
-                  multiple
-                  onChange={handleFileSelect}
-                  accept=".pdf,.doc,.docx,.xls,.xlsx,.csv,.txt,.jpg,.jpeg,.png,.webp"
-                />
+                {!isGuest && (
+                  <>
+                    <input
+                      type="file"
+                      ref={fileInputRef}
+                      className="hidden"
+                      multiple
+                      onChange={handleFileSelect}
+                      accept=".pdf,.doc,.docx,.xls,.xlsx,.csv,.txt,.jpg,.jpeg,.png,.webp"
+                    />
 
-                <div
-                  className={`uploadStrip rounded border-2 border-neutral-300 p-8 text-center cursor-pointer transition-all ${
-                    isDragging ? 'border-black bg-neutral-50 scale-[0.99]' : 'border-dashed hover:border-neutral-900 hover:bg-neutral-50/30'
-                  }`}
-                  onDragOver={handleDragOver}
-                  onDragLeave={handleDragLeave}
-                  onDrop={handleDrop}
-                  onClick={() => fileInputRef.current?.click()}
-                >
-                  <Upload className="mx-auto mb-2 text-neutral-400" size={24} />
-                  <b className="text-sm font-sans block text-neutral-800 mb-1">Drag &amp; drop files here, or click to browse</b>
-                  <div className="text-[10px] text-neutral-400 font-mono">Supports PDF, DOC, DOCX, XLS, XLSX, CSV, TXT, JPG, PNG, WEBP</div>
-                </div>
+                    <div
+                      className={`uploadStrip rounded border-2 border-neutral-300 p-8 text-center cursor-pointer transition-all ${
+                        isDragging ? 'border-black bg-neutral-50 scale-[0.99]' : 'border-dashed hover:border-neutral-900 hover:bg-neutral-50/30'
+                      }`}
+                      onDragOver={handleDragOver}
+                      onDragLeave={handleDragLeave}
+                      onDrop={handleDrop}
+                      onClick={() => fileInputRef.current?.click()}
+                    >
+                      <Upload className="mx-auto mb-2 text-neutral-400" size={24} />
+                      <b className="text-sm font-sans block text-neutral-800 mb-1">Drag &amp; drop files here, or click to browse</b>
+                      <div className="text-[10px] text-neutral-400 font-mono">Supports PDF, DOC, DOCX, XLS, XLSX, CSV, TXT, JPG, PNG, WEBP</div>
+                    </div>
+                  </>
+                )}
 
                 <div className="bg-white border border-neutral-200 rounded overflow-hidden shadow-xs">
                   <div className="bg-neutral-50 px-4 py-3 border-b border-neutral-200 flex items-center justify-between">
@@ -1653,38 +1780,41 @@ export default function OwnerDashboard({
                             Analyze
                           </button>
                           
-                          {/* Approval / Rejection buttons for owner/manager */}
-                          {doc.status !== 'Approved' && (
-                            <button
-                              onClick={() => onApproveDocument(doc.id, 'Approved')}
-                              className="px-2 py-1 text-[10px] font-semibold bg-green-900 text-white rounded hover:bg-green-800 transition-all flex items-center gap-0.5"
-                            >
-                              <Check size={10} /> Approve
-                            </button>
-                          )}
-                          {doc.status !== 'Rejected' && (
-                            <button
-                              onClick={() => onApproveDocument(doc.id, 'Rejected')}
-                              className="px-2 py-1 text-[10px] font-semibold bg-red-950 text-red-100 border border-red-800 rounded hover:bg-red-900 transition-all flex items-center gap-0.5"
-                            >
-                              <X size={10} /> Reject
-                            </button>
-                          )}
+                          {!isGuest && (
+                            <>
+                              {doc.status !== 'Approved' && (
+                                <button
+                                  onClick={() => onApproveDocument(doc.id, 'Approved')}
+                                  className="px-2 py-1 text-[10px] font-semibold bg-green-900 text-white rounded hover:bg-green-800 transition-all flex items-center gap-0.5"
+                                >
+                                  <Check size={10} /> Approve
+                                </button>
+                              )}
+                              {doc.status !== 'Rejected' && (
+                                <button
+                                  onClick={() => onApproveDocument(doc.id, 'Rejected')}
+                                  className="px-2 py-1 text-[10px] font-semibold bg-red-950 text-red-100 border border-red-800 rounded hover:bg-red-900 transition-all flex items-center gap-0.5"
+                                >
+                                  <X size={10} /> Reject
+                                </button>
+                              )}
 
-                          <button
-                            onClick={() => triggerRename(doc)}
-                            className="p-1 text-neutral-400 hover:text-black border border-transparent hover:border-neutral-200 rounded"
-                            title="Rename"
-                          >
-                            <Edit size={11} />
-                          </button>
-                          <button
-                            onClick={() => setDeleteDocumentTarget(doc)}
-                            className="p-1 text-neutral-400 hover:text-red-600 border border-transparent hover:border-neutral-200 rounded"
-                            title="Delete"
-                          >
-                            <Trash2 size={11} />
-                          </button>
+                              <button
+                                onClick={() => triggerRename(doc)}
+                                className="p-1 text-neutral-400 hover:text-black border border-transparent hover:border-neutral-200 rounded"
+                                title="Rename"
+                              >
+                                <Edit size={11} />
+                              </button>
+                              <button
+                                onClick={() => setDeleteDocumentTarget(doc)}
+                                className="p-1 text-neutral-400 hover:text-red-600 border border-transparent hover:border-neutral-200 rounded"
+                                title="Delete"
+                              >
+                                <Trash2 size={11} />
+                              </button>
+                            </>
+                          )}
                         </div>
                       </div>
                     ))}
@@ -1796,12 +1926,14 @@ export default function OwnerDashboard({
                   <h3 className="text-xs font-semibold tracking-wider text-neutral-500 uppercase">
                     Machine Index Registry ({equipment.length})
                   </h3>
-                  <button
-                    onClick={() => openEquipmentForm()}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-neutral-900 text-white hover:bg-neutral-800 text-xs font-semibold tracking-wider uppercase rounded"
-                  >
-                    <Plus size={13} /> Add Machine
-                  </button>
+                  {!isGuest && (
+                    <button
+                      onClick={() => openEquipmentForm()}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-neutral-900 text-white hover:bg-neutral-800 text-xs font-semibold tracking-wider uppercase rounded"
+                    >
+                      <Plus size={13} /> Add Machine
+                    </button>
+                  )}
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -1862,20 +1994,22 @@ export default function OwnerDashboard({
                         )}
                       </div>
 
-                      <div className="flex justify-end gap-1.5 border-t border-neutral-100 pt-3 mt-4">
-                        <button
-                          onClick={() => openEquipmentForm(eq)}
-                          className="p-1 text-neutral-400 hover:text-black border border-transparent hover:border-neutral-200 rounded"
-                        >
-                          <Edit size={12} />
-                        </button>
-                        <button
-                          onClick={() => setDeleteEquipmentTarget(eq)}
-                          className="p-1 text-neutral-400 hover:text-red-600 border border-transparent hover:border-neutral-200 rounded"
-                        >
-                          <Trash2 size={12} />
-                        </button>
-                      </div>
+                      {!isGuest && (
+                        <div className="flex justify-end gap-1.5 border-t border-neutral-100 pt-3 mt-4">
+                          <button
+                            onClick={() => openEquipmentForm(eq)}
+                            className="p-1 text-neutral-400 hover:text-black border border-transparent hover:border-neutral-200 rounded"
+                          >
+                            <Edit size={12} />
+                          </button>
+                          <button
+                            onClick={() => setDeleteEquipmentTarget(eq)}
+                            className="p-1 text-neutral-400 hover:text-red-600 border border-transparent hover:border-neutral-200 rounded"
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -2047,7 +2181,12 @@ export default function OwnerDashboard({
                         type="text"
                         placeholder="e.g., m-105"
                         value={newId}
-                        onChange={(e) => setNewId(e.target.value)}
+                        onChange={(e) => {
+                          setNewId(e.target.value);
+                          if (accountMsg.isError) {
+                            setAccountMsg({ text: '', isError: false });
+                          }
+                        }}
                         className="w-full text-xs p-2 border-b border-neutral-200 outline-none focus:border-black bg-neutral-50/50 mt-1"
                       />
                     </div>
@@ -2129,7 +2268,7 @@ export default function OwnerDashboard({
                           >
                             <Edit size={12} />
                           </button>
-                          {emp.employeeId !== '80079385' && (currentUser.role === 'owner' || (currentUser.role === 'manager' && emp.role === 'worker')) && (
+                          {!(emp.role === 'owner' && accounts.filter(a => a.role === 'owner').length <= 1) && (currentUser.role === 'owner' || (currentUser.role === 'manager' && emp.role === 'worker')) && (
                             <button
                               onClick={() => {
                                 const targetAcc = accounts.find(a => a.id === emp.employeeId);
@@ -2209,20 +2348,22 @@ export default function OwnerDashboard({
                       Triggering red alert broadcast notifies every shift safety officer, sounds visual sirens on the plant floor, and displays evacuation directions directly on workers terminals. Use with caution.
                     </p>
                   </div>
-                  <div className="flex gap-2 mt-4 self-end">
-                    <button
-                      onClick={() => alert('RED ALERT ISSUED: Sirens initialized on plant floors Sectors 1-4. Shift Lead notified.')}
-                      className="bg-red-600 text-white hover:bg-red-700 px-4 py-2 text-xs font-semibold tracking-wider uppercase transition-all rounded"
-                    >
-                      BroadCast Red Alert
-                    </button>
-                    <button
-                      onClick={() => alert('ALL CLEAR broadcast sent. Plant operations resuming.')}
-                      className="bg-neutral-900 text-red-200 hover:bg-neutral-800 px-4 py-2 text-xs font-semibold tracking-wider uppercase transition-all rounded border border-red-800"
-                    >
-                      All Clear Signals
-                    </button>
-                  </div>
+                  {!isGuest && (
+                    <div className="flex gap-2 mt-4 self-end">
+                      <button
+                        onClick={() => alert('RED ALERT ISSUED: Sirens initialized on plant floors Sectors 1-4. Shift Lead notified.')}
+                        className="bg-red-600 text-white hover:bg-red-700 px-4 py-2 text-xs font-semibold tracking-wider uppercase transition-all rounded"
+                      >
+                        BroadCast Red Alert
+                      </button>
+                      <button
+                        onClick={() => alert('ALL CLEAR broadcast sent. Plant operations resuming.')}
+                        className="bg-neutral-900 text-red-200 hover:bg-neutral-800 px-4 py-2 text-xs font-semibold tracking-wider uppercase transition-all rounded border border-red-800"
+                      >
+                        All Clear Signals
+                      </button>
+                    </div>
+                  )}
                 </div>
 
                 {/* PROCEDURAL DIRECTS */}
@@ -2232,28 +2373,30 @@ export default function OwnerDashboard({
                       <h3 className="text-xs font-semibold uppercase tracking-wider text-neutral-500">
                         Operational Safety SOP Master Files
                       </h3>
-                      {!isEditingEmergency ? (
-                        <button
-                          onClick={() => setIsEditingEmergency(true)}
-                          className="text-xs font-semibold border border-neutral-200 px-2.5 py-1 hover:border-black rounded bg-white"
-                        >
-                          Modify Protocols
-                        </button>
-                      ) : (
-                        <div className="flex gap-1.5">
+                      {!isGuest && (
+                        !isEditingEmergency ? (
                           <button
-                            onClick={handleSaveEmergency}
-                            className="text-xs font-semibold bg-neutral-900 text-white px-2.5 py-1 hover:bg-neutral-800 rounded"
-                          >
-                            Save Rules
-                          </button>
-                          <button
-                            onClick={() => setIsEditingEmergency(false)}
+                            onClick={() => setIsEditingEmergency(true)}
                             className="text-xs font-semibold border border-neutral-200 px-2.5 py-1 hover:border-black rounded bg-white"
                           >
-                            Cancel
+                            Modify Protocols
                           </button>
-                        </div>
+                        ) : (
+                          <div className="flex gap-1.5">
+                            <button
+                              onClick={handleSaveEmergency}
+                              className="text-xs font-semibold bg-neutral-900 text-white px-2.5 py-1 hover:bg-neutral-800 rounded"
+                            >
+                              Save Rules
+                            </button>
+                            <button
+                              onClick={() => setIsEditingEmergency(false)}
+                              className="text-xs font-semibold border border-neutral-200 px-2.5 py-1 hover:border-black rounded bg-white"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        )
                       )}
                     </div>
 
@@ -3028,138 +3171,294 @@ export default function OwnerDashboard({
 
       {/* EMPLOYEE FORM DRAWERS */}
       {isEmployeeFormOpen && editingEmployee && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center z-50 p-4">
-          <div className="bg-white/95 backdrop-blur-lg border border-neutral-200/80 max-w-sm w-full p-6 shadow-2xl rounded-[28px] relative">
-            <h3 className="text-sm font-bold uppercase tracking-wider text-gray-900 mb-5 text-center">
-              Edit Employee Profile
-            </h3>
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center z-50 p-4 overflow-hidden">
+          <div className="bg-white/95 backdrop-blur-lg border border-neutral-200/80 w-[min(480px,calc(100vw-24px))] max-h-[calc(100vh-32px)] flex flex-col p-6 shadow-2xl rounded-[28px] relative overflow-hidden">
+            <div className="flex-shrink-0 pb-3 border-b border-neutral-100 text-center mb-3">
+              <h3 className="text-sm font-bold uppercase tracking-wider text-gray-900">
+                Edit Employee Profile
+              </h3>
+            </div>
 
-            <form onSubmit={saveEmployee} className="space-y-4 text-xs">
-              {/* Profile Photo Upload Block */}
-              <div className="flex flex-col items-center justify-center pb-4 border-b border-neutral-100 mb-2">
-                <div 
-                  onClick={() => profilePhotoInputRef.current?.click()}
-                  className="w-[130px] h-[130px] rounded-full relative overflow-visible mx-auto border border-neutral-200/80 shadow-lg bg-neutral-50/50 backdrop-blur-md group cursor-pointer hover:scale-[1.03] active:scale-[0.99] transition-all duration-300"
-                >
-                  <SafeAvatar
-                    name={editingEmployee.name}
-                    photo={editingEmployee.photo}
-                    className="w-full h-full"
-                  />
-                  <div className="absolute bottom-1 right-1 bg-neutral-900 text-white hover:bg-black p-2.5 rounded-full border border-white shadow-md cursor-pointer hover:scale-110 active:scale-95 transition-all duration-200 shadow-black/15 flex items-center justify-center">
-                    <Camera size={14} />
+            <form onSubmit={saveEmployee} className="flex flex-col flex-1 min-h-0 overflow-hidden">
+              <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden space-y-4 text-xs pr-1">
+                {/* Profile Photo Upload Block */}
+                <div className="flex flex-col items-center justify-center pb-4 border-b border-neutral-100 mb-2">
+                  <div 
+                    onClick={() => profilePhotoInputRef.current?.click()}
+                    className="w-[130px] h-[130px] rounded-full relative overflow-visible mx-auto border border-neutral-200/80 shadow-lg bg-neutral-50/50 backdrop-blur-md group cursor-pointer hover:scale-[1.03] active:scale-[0.99] transition-all duration-300"
+                  >
+                    <SafeAvatar
+                      name={editingEmployee.name}
+                      photo={editingEmployee.photo}
+                      className="w-full h-full"
+                    />
+                    <div className="absolute bottom-1 right-1 bg-neutral-900 text-white hover:bg-black p-2.5 rounded-full border border-white shadow-md cursor-pointer hover:scale-110 active:scale-95 transition-all duration-200 shadow-black/15 flex items-center justify-center">
+                      <Camera size={14} />
+                    </div>
                   </div>
-                </div>
 
-                <div className="flex flex-col items-center gap-1.5 mt-3 text-center">
-                  <div className="flex gap-4">
-                    <button
-                      type="button"
-                      onClick={() => profilePhotoInputRef.current?.click()}
-                      className="text-[11px] font-bold uppercase tracking-wider text-neutral-800 hover:text-black transition-all hover:underline"
-                    >
-                      Change Photo
-                    </button>
-                    {editingEmployee.photo && (
+                  <div className="flex flex-col items-center gap-1.5 mt-3 text-center">
+                    <div className="flex gap-4">
                       <button
                         type="button"
-                        onClick={() => setEditingEmployee({ ...editingEmployee, photo: '' })}
-                        className="text-[11px] font-bold uppercase tracking-wider text-red-500 hover:text-red-700 transition-all hover:underline"
+                        onClick={() => profilePhotoInputRef.current?.click()}
+                        className="text-[11px] font-bold uppercase tracking-wider text-neutral-800 hover:text-black transition-all hover:underline"
                       >
-                        Remove Photo
+                        Change Photo
                       </button>
-                    )}
+                      {editingEmployee.photo && (
+                        <button
+                          type="button"
+                          onClick={() => setEditingEmployee({ ...editingEmployee, photo: '' })}
+                          className="text-[11px] font-bold uppercase tracking-wider text-red-500 hover:text-red-700 transition-all hover:underline"
+                        >
+                          Remove Photo
+                        </button>
+                      )}
+                    </div>
+                    <span className="text-[9px] text-neutral-400 font-sans uppercase tracking-wider font-semibold">JPG or JPEG, max 5 MB</span>
                   </div>
-                  <span className="text-[9px] text-neutral-400 font-sans uppercase tracking-wider font-semibold">JPG or JPEG, max 5 MB</span>
+
+                  <input
+                    type="file"
+                    ref={profilePhotoInputRef}
+                    onChange={handleProfilePhotoUpload}
+                    accept="image/jpeg, image/jpg"
+                    className="hidden"
+                  />
+
+                  {profileUploadError && (
+                    <div className="text-[10px] text-red-500 font-medium mt-2.5 p-2 bg-red-50/50 border border-red-100 rounded-xl text-center max-w-[240px]">
+                      ⚠️ {profileUploadError}
+                    </div>
+                  )}
                 </div>
 
-                <input
-                  type="file"
-                  ref={profilePhotoInputRef}
-                  onChange={handleProfilePhotoUpload}
-                  accept="image/jpeg, image/jpg"
-                  className="hidden"
-                />
+                <div className="field">
+                  <label className="text-[10px] font-mono uppercase text-neutral-400">Employee Name</label>
+                  <input
+                    type="text"
+                    value={editingEmployee.name}
+                    onChange={(e) => setEditingEmployee({ ...editingEmployee, name: e.target.value })}
+                    className="w-full p-2 border-b border-neutral-200 outline-none bg-neutral-50/50 mt-1 rounded-lg"
+                    required
+                  />
+                </div>
 
-                {profileUploadError && (
-                  <div className="text-[10px] text-red-500 font-medium mt-2.5 p-2 bg-red-50/50 border border-red-100 rounded-xl text-center max-w-[240px]">
-                    ⚠️ {profileUploadError}
+                <div className="field">
+                  <label className="text-[10px] font-mono uppercase text-neutral-400">Department</label>
+                  <input
+                    type="text"
+                    value={editingEmployee.department}
+                    onChange={(e) => setEditingEmployee({ ...editingEmployee, department: e.target.value })}
+                    className="w-full p-2 border-b border-neutral-200 outline-none bg-neutral-50/50 mt-1 rounded-lg"
+                    required
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="field">
+                    <label className="text-[10px] font-mono uppercase text-neutral-400">Phone</label>
+                    <input
+                      type="text"
+                      value={editingEmployee.phone}
+                      onChange={(e) => setEditingEmployee({ ...editingEmployee, phone: e.target.value })}
+                      className="w-full p-2 border-b border-neutral-200 outline-none bg-neutral-50/50 mt-1 rounded-lg"
+                    />
+                  </div>
+                  <div className="field">
+                    <label className="text-[10px] font-mono uppercase text-neutral-400">Email</label>
+                    <input
+                      type="email"
+                      value={editingEmployee.email}
+                      onChange={(e) => setEditingEmployee({ ...editingEmployee, email: e.target.value })}
+                      className="w-full p-2 border-b border-neutral-200 outline-none bg-neutral-50/50 mt-1 rounded-lg"
+                    />
+                  </div>
+                </div>
+
+                <div className="field">
+                  <label className="text-[10px] font-mono uppercase text-neutral-400">Work Status</label>
+                  <select
+                    value={editingEmployee.status}
+                    onChange={(e: any) => setEditingEmployee({ ...editingEmployee, status: e.target.value })}
+                    className="w-full p-2 border-b border-neutral-200 bg-white mt-1 rounded-lg"
+                  >
+                    <option value="Active">Active</option>
+                    <option value="On Leave">On Leave</option>
+                    <option value="Inactive">Inactive</option>
+                  </select>
+                </div>
+
+                {/* PASSWORD MANAGEMENT SECTION (Owners & Managers Only) */}
+                {(currentUser.role === 'owner' || currentUser.role === 'manager') && (
+                  <div className="pt-3 border-t border-neutral-100 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] font-mono uppercase font-bold text-neutral-500 tracking-wider flex items-center gap-1">
+                        <Lock size={12} className="text-neutral-700" /> Password Management
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleGenerateTempPassword}
+                        className="text-[10px] font-mono font-bold text-neutral-800 hover:text-black bg-neutral-100 hover:bg-neutral-200 px-2.5 py-1 rounded-md transition-all flex items-center gap-1 border border-neutral-300 cursor-pointer"
+                      >
+                        <Key size={11} /> Generate Temp Password
+                      </button>
+                    </div>
+
+                    <div className="field relative">
+                      <label className="text-[10px] font-mono uppercase text-neutral-400">New Password</label>
+                      <div className="relative mt-1">
+                        <input
+                          type={showNewPassword ? 'text' : 'password'}
+                          value={resetNewPassword}
+                          onChange={(e) => {
+                            setResetNewPassword(e.target.value);
+                            setResetPasswordError('');
+                          }}
+                          placeholder="••••••••••"
+                          className="w-full p-2 pr-8 border-b border-neutral-200 outline-none bg-neutral-50/50 rounded-lg text-xs"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowNewPassword(!showNewPassword)}
+                          className="absolute right-2 top-2.5 text-neutral-400 hover:text-neutral-700 cursor-pointer"
+                        >
+                          {showNewPassword ? <EyeOff size={14} /> : <Eye size={14} />}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="field relative">
+                      <label className="text-[10px] font-mono uppercase text-neutral-400">Confirm New Password</label>
+                      <div className="relative mt-1">
+                        <input
+                          type={showConfirmPassword ? 'text' : 'password'}
+                          value={resetConfirmPassword}
+                          onChange={(e) => {
+                            setResetConfirmPassword(e.target.value);
+                            setResetPasswordError('');
+                          }}
+                          placeholder="••••••••••"
+                          className="w-full p-2 pr-8 border-b border-neutral-200 outline-none bg-neutral-50/50 rounded-lg text-xs"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                          className="absolute right-2 top-2.5 text-neutral-400 hover:text-neutral-700 cursor-pointer"
+                        >
+                          {showConfirmPassword ? <EyeOff size={14} /> : <Eye size={14} />}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 pt-1">
+                      <input
+                        type="checkbox"
+                        id="requirePasswordChange"
+                        checked={requirePasswordChangeNextLogin}
+                        onChange={(e) => setRequirePasswordChangeNextLogin(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-neutral-900 rounded border-gray-300 cursor-pointer"
+                      />
+                      <label htmlFor="requirePasswordChange" className="text-[10px] font-medium text-neutral-600 select-none cursor-pointer">
+                        Require password change on next login
+                      </label>
+                    </div>
+
+                    {(resetNewPassword || resetConfirmPassword) && (
+                      <div className="field bg-amber-50/50 p-2.5 rounded-xl border border-amber-200/80 mt-2">
+                        <label className="text-[10px] font-mono font-bold text-amber-900 uppercase flex items-center gap-1">
+                          <Lock size={11} /> Confirm Your Owner/Manager Password
+                        </label>
+                        <input
+                          type="password"
+                          value={actingManagerPassword}
+                          onChange={(e) => {
+                            setActingManagerPassword(e.target.value);
+                            setResetPasswordError('');
+                          }}
+                          placeholder="Re-enter your password to confirm"
+                          className="w-full p-1.5 border-b border-amber-300 outline-none bg-white mt-1 rounded text-xs"
+                        />
+                      </div>
+                    )}
+
+                    {resetPasswordError && (
+                      <div className="text-[10px] text-red-600 font-medium p-2 bg-red-50 border border-red-200 rounded-xl text-center">
+                        ⚠️ {resetPasswordError}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
 
-              <div className="field">
-                <label className="text-[10px] font-mono uppercase text-neutral-400">Employee Name</label>
-                <input
-                  type="text"
-                  value={editingEmployee.name}
-                  onChange={(e) => setEditingEmployee({ ...editingEmployee, name: e.target.value })}
-                  className="w-full p-2 border-b border-neutral-200 outline-none bg-neutral-50/50 mt-1 rounded-lg"
-                  required
-                />
-              </div>
-
-              <div className="field">
-                <label className="text-[10px] font-mono uppercase text-neutral-400">Department</label>
-                <input
-                  type="text"
-                  value={editingEmployee.department}
-                  onChange={(e) => setEditingEmployee({ ...editingEmployee, department: e.target.value })}
-                  className="w-full p-2 border-b border-neutral-200 outline-none bg-neutral-50/50 mt-1 rounded-lg"
-                  required
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div className="field">
-                  <label className="text-[10px] font-mono uppercase text-neutral-400">Phone</label>
-                  <input
-                    type="text"
-                    value={editingEmployee.phone}
-                    onChange={(e) => setEditingEmployee({ ...editingEmployee, phone: e.target.value })}
-                    className="w-full p-2 border-b border-neutral-200 outline-none bg-neutral-50/50 mt-1 rounded-lg"
-                  />
-                </div>
-                <div className="field">
-                  <label className="text-[10px] font-mono uppercase text-neutral-400">Email</label>
-                  <input
-                    type="email"
-                    value={editingEmployee.email}
-                    onChange={(e) => setEditingEmployee({ ...editingEmployee, email: e.target.value })}
-                    className="w-full p-2 border-b border-neutral-200 outline-none bg-neutral-50/50 mt-1 rounded-lg"
-                  />
-                </div>
-              </div>
-
-              <div className="field">
-                <label className="text-[10px] font-mono uppercase text-neutral-400">Work Status</label>
-                <select
-                  value={editingEmployee.status}
-                  onChange={(e: any) => setEditingEmployee({ ...editingEmployee, status: e.target.value })}
-                  className="w-full p-2 border-b border-neutral-200 bg-white mt-1 rounded-lg"
-                >
-                  <option value="Active">Active</option>
-                  <option value="On Leave">On Leave</option>
-                  <option value="Inactive">Inactive</option>
-                </select>
-              </div>
-
-              <div className="flex justify-end gap-3 pt-3 border-t border-neutral-100">
+              {/* STICKY FOOTER */}
+              <div className="flex-shrink-0 pt-3 mt-3 border-t border-neutral-100 flex justify-end gap-3 bg-white/95">
                 <button
                   type="button"
-                  className="px-4 py-2 border border-gray-300 text-xs font-semibold uppercase tracking-wider rounded-xl hover:border-black transition-all"
+                  className="px-4 py-2 border border-gray-300 text-xs font-semibold uppercase tracking-wider rounded-xl hover:border-black transition-all cursor-pointer"
                   onClick={() => setIsEmployeeFormOpen(false)}
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 bg-neutral-900 text-white text-xs font-semibold uppercase tracking-wider rounded-xl hover:bg-black transition-all"
+                  className="px-4 py-2 bg-neutral-900 text-white text-xs font-semibold uppercase tracking-wider rounded-xl hover:bg-black transition-all cursor-pointer"
                 >
                   Save Profile
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* SINGLE-USE TEMPORARY PASSWORD CONFIRMATION MODAL */}
+      {generatedTempPasswordModal && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-xs flex items-center justify-center z-[120] p-4">
+          <div className="bg-white border border-neutral-300 max-w-sm w-full p-6 shadow-2xl rounded-[28px] relative text-center">
+            <div className="w-12 h-12 rounded-full bg-green-100 text-green-700 mx-auto flex items-center justify-center mb-3">
+              <Key size={24} />
+            </div>
+
+            <h3 className="text-sm font-bold uppercase tracking-wider text-neutral-900 mb-1">
+              Temporary Password Generated
+            </h3>
+
+            <p className="text-xs text-neutral-600 leading-relaxed mb-4">
+              The temporary password for <b>{editingEmployee?.name || 'the employee'}</b> has been set. Share this password securely with the user.
+            </p>
+
+            <div className="bg-neutral-900 text-green-400 p-3 rounded-xl font-mono text-sm font-bold tracking-widest border border-neutral-800 flex items-center justify-between mb-4 shadow-inner">
+              <span className="select-all">{generatedTempPasswordModal}</span>
+              <button
+                type="button"
+                onClick={() => {
+                  navigator.clipboard.writeText(generatedTempPasswordModal);
+                  setCopiedTempPassword(true);
+                  setTimeout(() => setCopiedTempPassword(false), 2000);
+                }}
+                className="bg-neutral-800 hover:bg-neutral-700 text-white p-1.5 rounded-lg transition-all text-xs font-mono flex items-center gap-1 shrink-0 ml-2 border border-neutral-700 cursor-pointer"
+              >
+                {copiedTempPassword ? <Check size={14} className="text-green-400" /> : <Copy size={14} />}
+                {copiedTempPassword ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+
+            <div className="text-[10px] text-amber-700 bg-amber-50 p-2.5 rounded-xl border border-amber-200 text-left mb-5 leading-snug font-medium">
+              ⚠️ <b>Security Notice:</b> This temporary password will only be displayed once. After closing this dialog, it cannot be recovered or viewed again.
+            </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                setGeneratedTempPasswordModal(null);
+                setCopiedTempPassword(false);
+              }}
+              className="w-full py-2.5 bg-neutral-900 hover:bg-black text-white text-xs font-bold uppercase tracking-wider rounded-xl transition-all shadow-md cursor-pointer"
+            >
+              Close & Done
+            </button>
           </div>
         </div>
       )}
@@ -3252,6 +3551,17 @@ export default function OwnerDashboard({
                   value={editProfileName}
                   onChange={(e) => setEditProfileName(e.target.value)}
                   className="w-full p-2 border-b border-neutral-200 outline-none bg-neutral-50/50 mt-1 rounded-lg"
+                  required
+                />
+              </div>
+
+              <div className="field">
+                <label className="text-[10px] font-mono uppercase text-neutral-400">Employee ID / Login ID</label>
+                <input
+                  type="text"
+                  value={editProfileId}
+                  onChange={(e) => setEditProfileId(e.target.value)}
+                  className="w-full p-2 border-b border-neutral-200 outline-none bg-neutral-50/50 mt-1 rounded-lg font-mono text-sm"
                   required
                 />
               </div>

@@ -10,6 +10,7 @@ export default function LoginScreen({ accounts, onLoginSuccess }: LoginScreenPro
   const [userId, setUserId] = useState('');
   const [password, setPassword] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
+  const [isGuestLoading, setIsGuestLoading] = useState(false);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -42,6 +43,28 @@ export default function LoginScreen({ accounts, onLoginSuccess }: LoginScreenPro
       }
     } catch (err) {
       setErrorMsg('Network error. Failed to connect to server.');
+    }
+  };
+
+  const handleGuestLogin = async () => {
+    setIsGuestLoading(true);
+    setErrorMsg('');
+    try {
+      const res = await fetch('/api/auth/guest-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include'
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success && data.user) {
+        onLoginSuccess(data.user);
+      } else {
+        setErrorMsg(data.message || data.error || 'Failed to initiate Guest Demo session.');
+      }
+    } catch (err) {
+      setErrorMsg('Network error. Failed to initiate Guest Demo session.');
+    } finally {
+      setIsGuestLoading(false);
     }
   };
 
@@ -89,6 +112,15 @@ export default function LoginScreen({ accounts, onLoginSuccess }: LoginScreenPro
               
               <button type="submit" className="btn-glass-primary w-full py-3.5 mt-2 text-xs uppercase tracking-widest font-bold">
                 Sign In
+              </button>
+
+              <button
+                type="button"
+                onClick={handleGuestLogin}
+                disabled={isGuestLoading}
+                className="w-full py-3 mt-2 text-xs uppercase tracking-widest font-bold text-neutral-700 bg-neutral-100 hover:bg-neutral-200 border border-neutral-200/80 rounded-xl transition-all cursor-pointer disabled:opacity-50"
+              >
+                {isGuestLoading ? 'Connecting...' : 'Continue as Guest'}
               </button>
             </form>
 

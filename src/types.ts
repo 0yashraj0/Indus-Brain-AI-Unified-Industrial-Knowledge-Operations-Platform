@@ -1,4 +1,4 @@
-export type UserRole = 'owner' | 'manager' | 'worker';
+export type UserRole = 'owner' | 'manager' | 'worker' | 'DEMO_GUEST';
 
 export interface Account {
   id: string;
@@ -6,6 +6,12 @@ export interface Account {
   role: UserRole;
   name: string;
   photo?: string;
+  credentialsVersion?: number;
+  mustChangePassword?: boolean;
+  isDemo?: boolean;
+  tenantId?: string;
+  sessionExpiresAt?: number;
+  demoView?: 'WORKER' | 'OWNER_MANAGER';
 }
 
 export interface Document {

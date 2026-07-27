@@ -45,8 +45,9 @@ interface WorkerDashboardProps {
   equipment: Equipment[];
   emergency: EmergencyData;
   onAddReport: (report: Omit<WorkerReport, 'id' | 'timestamp' | 'workerName'>) => void;
-  onUpdateEmployee: (emp: Employee, newPassword?: string) => Promise<void>;
+  onUpdateEmployee: (emp: Employee, newPassword?: string, newEmployeeId?: string) => Promise<void>;
   onSignOut: () => void;
+  onChangeGuestView?: () => void;
 }
 
 type WorkerTab = 'ask' | 'docs' | 'equipment' | 'report' | 'emergency';
@@ -60,7 +61,9 @@ export default function WorkerDashboard({
   onAddReport,
   onUpdateEmployee,
   onSignOut,
+  onChangeGuestView,
 }: WorkerDashboardProps) {
+  const isGuest = currentUser.role === 'DEMO_GUEST';
   const [activeTab, setActiveTab] = useState<WorkerTab>('ask');
   const [isSidebarOpen, setSidebarOpen] = useState(false);
 
@@ -94,12 +97,11 @@ export default function WorkerDashboard({
         photo: editProfilePhoto
       };
 
-      await onUpdateEmployee(updatedEmp, editProfilePassword || undefined);
+      await onUpdateEmployee(updatedEmp);
       setEditProfileSuccess('Profile updated successfully!');
       setTimeout(() => {
         setIsEditProfileModalOpen(false);
         setEditProfileSuccess('');
-        setEditProfilePassword('');
       }, 1500);
     } catch (error) {
       setEditProfileError('Failed to update profile. Please try again.');
@@ -329,13 +331,13 @@ export default function WorkerDashboard({
       const controller = new AbortController();
       let timer = setTimeout(() => {
         controller.abort();
-      }, 15000);
+      }, 60000);
 
       const resetTimer = () => {
         clearTimeout(timer);
         timer = setTimeout(() => {
           controller.abort();
-        }, 15000);
+        }, 60000);
       };
 
       const res = await fetch('/api/chat/stream', {
@@ -349,7 +351,7 @@ export default function WorkerDashboard({
           userId: currentUser.id,
           sessionId: targetSid,
           message: messageText,
-          imageBase64: chatImageBase64
+          imageBase64: chatImageBase64 || undefined
         }),
         signal: controller.signal
       });
@@ -378,13 +380,13 @@ export default function WorkerDashboard({
       }
 
       let buffer = '';
+      let isDone = false;
       while (true) {
         const { value, done } = await reader.read();
-        resetTimer(); // Reset the 15s timer on receiving data
+        resetTimer();
 
         if (done) break;
 
-        // Transition from pending to streaming once we receive actual data chunks
         setAiState('streaming');
 
         buffer += decoder.decode(value, { stream: true });
@@ -400,6 +402,7 @@ export default function WorkerDashboard({
             if (parsed.error) {
               setAiError(parsed.error);
               setAiState('error');
+              isDone = true;
             } else if (parsed.text !== undefined) {
               setStreamingText(parsed.text);
               if (parsed.isWarning) {
@@ -412,13 +415,21 @@ export default function WorkerDashboard({
               setIsStreaming(false);
               setStreamingText('');
               setAiState('idle');
+              isDone = true;
             }
           } catch (e) {
             // ignore partial JSON bounds
           }
         }
+        if (isDone) break;
       }
       clearTimeout(timer);
+      if (!isDone) {
+        await fetchSessions();
+        setIsStreaming(false);
+        setStreamingText('');
+        setAiState('idle');
+      }
     } catch (err: any) {
       console.error('Streaming error:', err);
       setIsStreaming(false);
@@ -521,6 +532,10 @@ export default function WorkerDashboard({
   // Submit Worker Report
   const handleSubmitReport = (e: React.FormEvent) => {
     e.preventDefault();
+    if (isGuest) {
+      setReportMsg("This action is disabled in Guest Demo Mode.");
+      return;
+    }
     if (!description.trim()) {
       setReportMsg("Please describe what's wrong before submitting.");
       return;
@@ -721,8 +736,18 @@ export default function WorkerDashboard({
                 </div>
               </div>
             </div>
-            <div className="badge hidden sm:flex font-mono text-[9px] font-bold border border-neutral-200 bg-neutral-50/50 text-neutral-500 tracking-widest uppercase px-3 py-1.5 rounded-full shrink-0">
-              Worker Console
+            <div className="flex items-center gap-2 shrink-0">
+              {isGuest && onChangeGuestView && (
+                <button
+                  onClick={onChangeGuestView}
+                  className="px-3 py-1.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-700 dark:text-amber-300 border border-amber-500/30 rounded-full text-[10px] font-mono font-bold uppercase transition-all cursor-pointer flex items-center gap-1.5"
+                >
+                  Switch Demo View
+                </button>
+              )}
+              <div className="badge hidden sm:flex font-mono text-[9px] font-bold border border-neutral-200 bg-neutral-50/50 text-neutral-500 tracking-widest uppercase px-3 py-1.5 rounded-full shrink-0">
+                {isGuest ? 'Guest Demo (Worker)' : 'Worker Console'}
+              </div>
             </div>
           </div>
 
@@ -1500,17 +1525,6 @@ export default function WorkerDashboard({
                   onChange={(e) => setEditProfileName(e.target.value)}
                   className="w-full p-2 border-b border-neutral-200 outline-none bg-neutral-50/50 mt-1 rounded-lg"
                   required
-                />
-              </div>
-
-              <div className="field">
-                <label className="text-[10px] font-mono uppercase text-neutral-400">New Password (leave empty to keep current)</label>
-                <input
-                  type="password"
-                  value={editProfilePassword}
-                  onChange={(e) => setEditProfilePassword(e.target.value)}
-                  placeholder="••••••••"
-                  className="w-full p-2 border-b border-neutral-200 outline-none bg-neutral-50/50 mt-1 rounded-lg"
                 />
               </div>
 
